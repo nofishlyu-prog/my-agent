@@ -124,6 +124,9 @@ class VoiceActivityDetector:
         self.tts_playing = False
         self.suppress_count = 0
         self._lock = threading.Lock()
+        # 用于打断检测：基线能量（TTS 播放时的背景能量）
+        self.baseline_energy = None
+        self.interrupt_detected = False
 
     def _calc_energy(self, audio: bytes) -> float:
         samples = struct.unpack(f'<{len(audio)//2}h', audio)
@@ -145,6 +148,58 @@ class VoiceActivityDetector:
                 self.suppress_count -= 1
                 return True
             return False
+
+    def process_for_interrupt(self, audio: bytes) -> Dict[str, Any]:
+        """专门用于打断检测 - 检测能量突增"""
+        energy = self._calc_energy(audio)
+
+        with self._lock:
+            self.energy_history.append(energy)
+
+            # 计算短期平均能量（最近 5 帧）和长期平均能量（所有历史）
+            if len(self.energy_history) >= 3:
+                recent_energies = list(self.energy_history)[-3:]
+                short_avg = sum(recent_energies) / len(recent_energies)
+                long_avg = sum(self.energy_history) / len(self.energy_history)
+            else:
+                short_avg = energy
+                long_avg = energy
+
+        # 阈值：使用固定低阈值
+        threshold = 30
+        is_speech = energy > threshold
+
+        result = {
+            'is_speech': is_speech,
+            'speech_start': False,
+            'speech_end': False,
+            'energy': energy,
+            'ignored': False,
+            'short_avg': short_avg,
+            'long_avg': long_avg
+        }
+
+        # 检测逻辑：能量突增（用户说话声音比 TTS 背景音大很多）
+        # 条件 1: 能量 > 短期平均 * 2 (突增 2 倍)
+        # 条件 2: 能量 > 阈值
+        if energy > short_avg * 2.5 and energy > threshold:
+            if not self.is_speaking:
+                self.speech_frames += 1
+                if self.speech_frames >= 2:  # 连续 2 帧确认
+                    self.is_speaking = True
+                    result['speech_start'] = True
+                    logger.debug(f"打断检测：能量突增 {energy:.1f} > {short_avg:.1f} * 2.5")
+            # 即使已经在说话状态，如果能量继续突增，也标记
+            elif energy > short_avg * 3.5:
+                result['speech_start'] = True
+                logger.debug(f"打断检测：能量持续突增 {energy:.1f}")
+        else:
+            # 能量下降时重置
+            if not is_speech:
+                self.speech_frames = 0
+                self.is_speaking = False
+
+        return result
 
     def process(self, audio: bytes) -> Dict[str, Any]:
         if self.should_ignore():
@@ -402,7 +457,7 @@ class FullDuplexAgent:
         self.tts_audio_queue = queue.Queue()
 
         self.should_interrupt = threading.Event()
-        self.is_tts_playing = False
+        self.is_tts_playing = threading.Event()  # 使用 Event 确保线程可见性
 
     def _set_state(self, new_state: AgentState):
         if self.state != new_state:
@@ -410,77 +465,88 @@ class FullDuplexAgent:
             self.state = new_state
 
     def _audio_input_loop(self):
+        """使用回调模式处理音频输入，避免阻塞"""
+        loop_count = 0
+        tts_check_count = 0
+        self._input_running = True
+
+        def callback(in_data, frame_count, time_info, status):
+            nonlocal loop_count, tts_check_count
+            loop_count += 1
+
+            # TTS 播放中，检测打断
+            if self.is_tts_playing.is_set() and self.config.barge_in_enabled:
+                tts_check_count += 1
+                # 使用专门的中断检测方法
+                vad_result = self.vad.process_for_interrupt(in_data)
+                # 打印日志
+                if tts_check_count <= 10 or tts_check_count % 20 == 0:
+                    logger.info(f"[TTS-Input] #{tts_check_count}, 能量={vad_result['energy']:.1f}, start={vad_result['speech_start']}")
+                # 检测到语音，发送音频给 ASR 进行识别
+                if vad_result['is_speech']:
+                    if self.asr.is_connected:
+                        self.asr.send(in_data)
+                    self._set_state(AgentState.LISTENING)
+                # 检测到打断，设置标志
+                if vad_result['speech_start']:
+                    self.should_interrupt.set()
+                    logger.info(f"⚡ 检测到打断 (能量：{vad_result['energy']:.1f})")
+            else:
+                # 非 TTS 播放时，正常处理
+                vad_result = self.vad.process(in_data)
+
+                if vad_result.get('ignored', False):
+                    pass  # 忽略
+                elif vad_result['is_speech']:
+                    self.audio_buffer.extend(in_data)
+                    if self.asr.is_connected:
+                        self.asr.send(in_data)
+                    self._set_state(AgentState.LISTENING)
+                elif vad_result['speech_end']:
+                    if len(self.audio_buffer) > 0:
+                        # 等待 ASR 处理音频
+                        time.sleep(0.5)
+                        # 停止 ASR 接收，触发 on_complete
+                        self.asr.stop()
+                        # 等待 on_complete 回调
+                        time.sleep(0.3)
+                        # 处理对话
+                        self._set_state(AgentState.THINKING)
+                        self._process_dialog()
+                        # 重启 ASR
+                        self.asr.start()
+                    # 清空缓冲和状态
+                    self.audio_buffer = bytearray()
+                    self.vad.reset()
+
+            # 每 50 帧打印一次状态
+            if loop_count % 50 == 0:
+                logger.info(f"[Input] 循环={loop_count}, tts_playing={self.is_tts_playing.is_set()}")
+
+            return (None, pyaudio.paContinue)
+
         stream = None
         try:
+            # 使用回调模式打开输入流，避免阻塞
             stream = self.audio.open(
                 rate=self.config.sample_rate,
                 channels=self.config.channels,
                 format=pyaudio.paInt16,
                 input=True,
-                frames_per_buffer=self.config.chunk_size
+                frames_per_buffer=self.config.chunk_size,
+                stream_callback=callback
             )
 
-            logger.info("🎤 麦克风已开启，请说话...")
+            logger.info("🎤 麦克风已开启，请说话...(回调模式)")
 
-            while self.is_running:
-                try:
-                    audio_data = stream.read(self.config.chunk_size, exception_on_overflow=False)
+            # 保持流运行
+            while self.is_running and stream.is_active():
+                time.sleep(0.1)
 
-                    # TTS 播放中，检测打断
-                    if self.is_tts_playing and self.config.barge_in_enabled:
-                        vad_result = self.vad.process(audio_data)
-                        # 检测到语音，触发打断
-                        if vad_result['is_speech']:
-                            # 发送音频给 ASR 进行识别
-                            if self.asr.is_connected:
-                                self.asr.send(audio_data)
-                            self._set_state(AgentState.LISTENING)
-                        if vad_result['speech_start']:
-                            self.should_interrupt.set()
-                            logger.info("⚡ 检测到打断")
-                        continue
-
-                    if not self.is_tts_playing:
-                        vad_result = self.vad.process(audio_data)
-
-                        if vad_result.get('ignored', False):
-                            continue
-
-                        if vad_result['is_speech']:
-                            self.audio_buffer.extend(audio_data)
-                            if self.asr.is_connected:
-                                self.asr.send(audio_data)
-                            self._set_state(AgentState.LISTENING)
-
-                        if vad_result['speech_end']:
-                            if len(self.audio_buffer) > 0:
-                                # 等待 ASR 处理音频
-                                time.sleep(0.5)
-
-                                # 停止 ASR 接收，触发 on_complete
-                                self.asr.stop()
-
-                                # 等待 on_complete 回调
-                                time.sleep(0.3)
-
-                                self._set_state(AgentState.THINKING)
-                                self._process_dialog()
-
-                                # 重启 ASR
-                                self.asr.start()
-
-                            # 清空缓冲和状态
-                            self.audio_buffer = bytearray()
-                            self.vad.reset()
-
-                except Exception as e:
-                    if self.is_running:
-                        logger.debug(f"输入错误：{e}")
-                        # ASR 断开时自动重连
-                        if not self.asr.is_connected:
-                            self.asr.restart()
-                        time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"输入流错误：{e}")
         finally:
+            self._input_running = False
             if stream:
                 try:
                     stream.stop_stream()
@@ -519,39 +585,68 @@ class FullDuplexAgent:
             self._set_state(AgentState.IDLE)
             return
 
-        self.is_tts_playing = True
+        logger.info(f"[TTS] 开始播放 ({len(audio)} 字节)")
+        self.is_tts_playing.set()
         self.vad.set_tts_playing(True)
+        # 重置 VAD 状态，确保打断检测正常工作
+        self.vad.is_speaking = False
+        self.vad.speech_frames = 0
+        self.vad.baseline_energy = None
+        self.vad.interrupt_detected = False
         self._set_state(AgentState.SPEAKING)
 
         interrupted = False
+        p = None
+        stream = None
         try:
-            stream = self.audio.open(
+            # 使用独立的 PyAudio 实例播放，避免阻塞主输入流
+            p = pyaudio.PyAudio()
+            stream = p.open(
                 rate=self.config.tts_sample_rate,
                 channels=1,
                 format=pyaudio.paInt16,
-                output=True
+                output=True,
+                frames_per_buffer=1024
             )
 
-            chunk_size = 4096
+            # 使用更小的 chunk 播放，更快响应打断
+            chunk_size = 1024
+            total_chunks = len(audio) // chunk_size + 1
+            logger.info(f"[TTS] 开始播放循环，共 {total_chunks} 块")
+            chunks_played = 0
             for i in range(0, len(audio), chunk_size):
+                chunks_played += 1
+                # 每次写之前先检查打断标志
                 if self.should_interrupt.is_set():
                     logger.info("⚡ 被打断")
                     interrupted = True
                     break
-                stream.write(audio[i:i+chunk_size])
+                # 写入小块音频
+                chunk = audio[i:i+chunk_size]
+                stream.write(chunk, exception_on_underflow=False)
+                # 每 50 块打印一次进度
+                if chunks_played % 50 == 0:
+                    logger.info(f"[TTS] 播放进度：{chunks_played}/{total_chunks}")
 
             stream.stop_stream()
             stream.close()
 
             # 如果被打断，处理用户的语音
             if interrupted:
+                # 立即停止播放
+                if stream:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except:
+                        pass
                 # 等待 ASR 识别完成
-                time.sleep(0.5)
-                self.asr.stop()
                 time.sleep(0.3)
+                self.asr.stop()
+                time.sleep(0.2)
 
                 # 获取识别结果并处理
-                user_input = self.asr.get_result(timeout=0.3)
+                user_input = self.asr.get_result(timeout=0.2)
                 if not user_input:
                     with self.asr._lock:
                         user_input = self.asr._current_text
@@ -570,8 +665,17 @@ class FullDuplexAgent:
         except Exception as e:
             logger.error(f"播放错误：{e}")
         finally:
-            self.is_tts_playing = False
+            if stream:
+                try:
+                    stream.close()
+                except:
+                    pass
+            if p:
+                p.terminate()
+            self.is_tts_playing.clear()
             self.vad.set_tts_playing(False)
+            self.vad.baseline_energy = None
+            self.vad.interrupt_detected = False
             self.should_interrupt.clear()
 
         self._set_state(AgentState.IDLE)
