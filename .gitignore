@@ -22,3 +22,6 @@ ENV/
 # System files
 .DS_Store
 Thumbs.db
+
+# Config with secrets
+config.json

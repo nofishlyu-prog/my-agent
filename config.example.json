@@ -1,0 +1,18 @@
+{
+  "api_key": "sk-your-api-key-here",
+  "sample_rate": 16000,
+  "vad_threshold": 100,
+  "asr_model": "paraformer-realtime-v2",
+  "llm_model": "qwen3-omni-flash-2025-12-01",
+  "tts_model": "cosyvoice-v1",
+  "tts_voice": "longxiaochun",
+  "enable_full_duplex": true,
+  "barge_in_enabled": true,
+  "first_token_timeout": 1.5,
+  "interrupt_keywords": [
+    "等等", "等一下", "停下", "停一下", "停",
+    "不要说了", "别说", "别说了",
+    "不对", "错了", "不是这样", "不是",
+    "取消", "停止", "闭嘴", "打断", "慢点", "重新说"
+  ]
+}
