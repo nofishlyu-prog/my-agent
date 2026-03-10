@@ -368,7 +368,8 @@ class FullDuplexAgent:
                 self._frame_count += 1
                 
                 # 根据当前状态处理
-                if self._tts_playing.is_set():
+                tts_playing = self._tts_playing.is_set()
+                if tts_playing:
                     self._handle_interrupt_detection(audio_data)
                 else:
                     self._handle_normal_vad(audio_data)
@@ -413,14 +414,19 @@ class FullDuplexAgent:
     
     def _handle_interrupt_detection(self, audio: bytes):
         """打断检测处理"""
+        import numpy as np
+        
+        # 计算能量
+        samples = np.frombuffer(audio, dtype=np.int16)
+        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+        
         result = self.vad.process_for_interrupt(audio)
         
-        if self._frame_count % 20 == 0 or result.get('speech_start'):
-            logger.debug(
-                f"[打断检测] frame={self._frame_count}, "
-                f"prob={result.get('speech_prob', 0):.2f}, "
-                f"is_speech={result.get('is_speech')}"
-            )
+        # 每帧都输出调试日志
+        logger.info(f"[打断检测] frame={self._frame_count}, energy={energy:.1f}, "
+                   f"prob={result.get('speech_prob', 0):.3f}, "
+                   f"is_speech={result.get('is_speech')}, "
+                   f"speech_start={result.get('speech_start')}")
         
         if result.get('is_speech'):
             self._interrupt_audio.extend(audio)
