@@ -11,7 +11,7 @@ from .asr import SpeechRecognizer
 from .llm import LanguageModel
 from .tts import TextToSpeech
 from .interrupt import SemanticInterruptDetector
-from .agent import FullDuplexAgent, AudioDeviceManager, AudioDevice, IS_WINDOWS, IS_MACOS
+from .agent import FullDuplexAgent
 
 __all__ = [
     'Config',
@@ -26,8 +26,4 @@ __all__ = [
     'TextToSpeech',
     'SemanticInterruptDetector',
     'FullDuplexAgent',
-    'AudioDeviceManager',
-    'AudioDevice',
-    'IS_WINDOWS',
-    'IS_MACOS',
 ]
