@@ -177,6 +177,10 @@ class FullDuplexAgent:
         self._tts_playing = threading.Event()
         self._stop_playback = threading.Event()
         
+        # 音频队列（用于回调模式）
+        self._audio_queue = Queue(maxsize=200)
+        self._use_callback_mode = True  # macOS 上使用回调模式避免阻塞
+        
         # 线程
         self._input_thread: Optional[threading.Thread] = None
         
@@ -295,39 +299,42 @@ class FullDuplexAgent:
         try:
             params = self._get_platform_audio_params()
             
-            self._input_stream = self._pyaudio_in.open(
-                rate=self.config.sample_rate,
-                channels=self.config.channels,
-                format=params['input_format'],
-                input=True,
-                input_device_index=self._input_device_index,
-                frames_per_buffer=params['input_frames_per_buffer'],
-                stream_callback=None
-            )
+            # macOS 使用回调模式避免阻塞
+            if self._use_callback_mode and IS_MACOS:
+                def audio_callback(in_data, frame_count, time_info, status):
+                    """音频输入回调"""
+                    try:
+                        self._audio_queue.put_nowait(in_data)
+                    except:
+                        pass
+                    return (None, pyaudio.paContinue)
+                
+                self._input_stream = self._pyaudio_in.open(
+                    rate=self.config.sample_rate,
+                    channels=self.config.channels,
+                    format=params['input_format'],
+                    input=True,
+                    input_device_index=self._input_device_index,
+                    frames_per_buffer=params['input_frames_per_buffer'],
+                    stream_callback=audio_callback
+                )
+                logger.info(f"🎤 麦克风输入流已启动 (回调模式, 缓冲区: {params['input_frames_per_buffer']})")
+            else:
+                self._input_stream = self._pyaudio_in.open(
+                    rate=self.config.sample_rate,
+                    channels=self.config.channels,
+                    format=params['input_format'],
+                    input=True,
+                    input_device_index=self._input_device_index,
+                    frames_per_buffer=params['input_frames_per_buffer'],
+                    stream_callback=None
+                )
+                logger.info(f"🎤 麦克风输入流已启动 (阻塞模式, 缓冲区: {params['input_frames_per_buffer']})")
             
-            logger.info(f"🎤 麦克风输入流已启动 (缓冲区: {params['input_frames_per_buffer']})")
             return True
             
         except Exception as e:
             logger.error(f"❌ 启动麦克风失败: {e}")
-            
-            # Windows 特殊处理：尝试不同的缓冲区大小
-            if IS_WINDOWS:
-                for buf_size in [512, 1024, 2048, 4096]:
-                    try:
-                        self._input_stream = self._pyaudio_in.open(
-                            rate=self.config.sample_rate,
-                            channels=self.config.channels,
-                            format=pyaudio.paInt16,
-                            input=True,
-                            input_device_index=self._input_device_index,
-                            frames_per_buffer=buf_size
-                        )
-                        logger.info(f"🎤 麦克风输入流已启动 (缓冲区: {buf_size})")
-                        return True
-                    except:
-                        continue
-            
             return False
     
     def _stop_input_stream(self):
@@ -348,30 +355,44 @@ class FullDuplexAgent:
         
         while self._is_running:
             try:
+                # 启动输入流
                 if self._input_stream is None:
                     if not self._start_input_stream():
                         time.sleep(0.5)
                         continue
                 
-                # 读取音频
+                # 从队列获取音频数据（回调模式）或阻塞读取
                 try:
-                    params = self._get_platform_audio_params()
-                    chunk_size = params['input_frames_per_buffer']
-                    audio_data = self._input_stream.read(chunk_size, exception_on_overflow=False)
+                    if self._use_callback_mode and IS_MACOS:
+                        # 回调模式：从队列获取
+                        audio_data = self._audio_queue.get(timeout=0.1)
+                    else:
+                        # 阻塞模式：直接读取
+                        params = self._get_platform_audio_params()
+                        chunk_size = params['input_frames_per_buffer']
+                        audio_data = self._input_stream.read(chunk_size, exception_on_overflow=False)
+                except Empty:
+                    # 队列为空，继续等待
+                    continue
                 except OSError as e:
                     error_msg = str(e)
-                    if "Stream closed" in error_msg or "Invalid stream" in error_msg or "Unanticipated host error" in error_msg:
+                    if "Stream closed" in error_msg or "Invalid stream" in error_msg:
+                        logger.warning(f"输入流错误，尝试重启: {e}")
                         self._input_stream = None
                         time.sleep(0.1)
                         continue
                     raise
+                except IOError as e:
+                    logger.debug(f"输入溢出: {e}")
+                    continue
                 
                 self._frame_count += 1
                 
-                # 定期输出心跳日志（确认音频输入线程在运行）
+                # 定期输出心跳日志
                 current_time = time.time()
                 if current_time - last_log_time > 1.0:
-                    logger.info(f"[音频心跳] frame={self._frame_count}, tts_playing={self._tts_playing.is_set()}")
+                    tts_state = self._tts_playing.is_set()
+                    logger.info(f"[音频心跳] frame={self._frame_count}, tts_playing={tts_state}")
                     last_log_time = current_time
                 
                 # 根据当前状态处理
