@@ -67,6 +67,7 @@ class FullDuplexAgent:
         # TTS 控制
         self._tts_playing = threading.Event()
         self._stop_playback = threading.Event()
+        self._tts_start_time = 0  # TTS 开始播放时间
         self._tts_thread: Optional[threading.Thread] = None
         self._tts_queue = Queue(maxsize=5)
         
@@ -214,6 +215,12 @@ class FullDuplexAgent:
 
     def _handle_interrupt_detection(self, audio: bytes):
         """打断检测处理"""
+        # 检查是否在静默期内（TTS 开始后 500ms 内不做检测）
+        if self._tts_start_time > 0:
+            elapsed = time.time() - self._tts_start_time
+            if elapsed < 0.5:  # 500ms 静默期
+                return
+        
         result = self.vad.process_for_interrupt(audio)
         
         if result.get('is_speech'):
@@ -257,6 +264,7 @@ class FullDuplexAgent:
         
         self._set_state(AgentState.SPEAKING)
         self._tts_playing.set()
+        self._tts_start_time = time.time()  # 记录开始时间
         self._stop_playback.clear()
         self.vad.set_tts_playing(True)
         self.vad.barge_in_detector.set_tts_state(True)
@@ -296,6 +304,7 @@ class FullDuplexAgent:
             logger.error(f"播放错误: {e}")
         finally:
             self._tts_playing.clear()
+            self._tts_start_time = 0  # 重置开始时间
             self._stop_playback.clear()
             self.vad.set_tts_playing(False)
             self.vad.barge_in_detector.set_tts_state(False)
