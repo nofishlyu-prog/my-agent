@@ -329,6 +329,10 @@ class BargeInDetector:
         self.confirm_frames = getattr(config, 'barge_in_confirm_frames', 3)
         self.delta_threshold = 50
         
+        # Silero 语音概率阈值（更高以过滤 TTS 声音）
+        self.silero_threshold = 0.7  # 需要 70% 以上概率才认为是语音
+        self.silero_confirm_frames = 5  # 需要连续 5 帧确认
+        
         # TTS 状态
         self._tts_playing = False
         self._lock = threading.Lock()
@@ -380,18 +384,25 @@ class BargeInDetector:
         # Silero VAD 模式
         if self._silero is not None:
             silero_result = self._silero.process(audio)
-            result['speech_prob'] = silero_result.get('speech_prob', 0)
+            speech_prob = silero_result.get('speech_prob', 0)
+            result['speech_prob'] = speech_prob
             
-            if silero_result['is_speech']:
+            # 更严格的语音判断：概率需要超过阈值
+            is_speech = speech_prob > self.silero_threshold
+            
+            if is_speech:
                 result['is_speech'] = True
                 self._speaking_frames += 1
-                if self._speaking_frames >= self.confirm_frames:
+                
+                # 需要连续多帧确认
+                if self._speaking_frames >= self.silero_confirm_frames:
                     if not self._is_speaking:
                         self._is_speaking = True
                         result['speech_start'] = True
                         result['reason'] = 'silero_detected'
-                        logger.info(f"⚡ Silero 打断: prob={result['speech_prob']:.2f}")
+                        logger.info(f"⚡ Silero 打断: prob={speech_prob:.2f}, frames={self._speaking_frames}")
             else:
+                # 概率不够高，减少计数
                 self._speaking_frames = max(0, self._speaking_frames - 1)
                 if self._speaking_frames == 0:
                     self._is_speaking = False

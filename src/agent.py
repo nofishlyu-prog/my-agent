@@ -214,22 +214,35 @@ class FullDuplexAgent:
             self._set_state(AgentState.IDLE)
 
     def _handle_interrupt_detection(self, audio: bytes):
-        """打断检测处理"""
-        # 检查是否在静默期内（TTS 开始后 500ms 内不做检测）
+        """打断检测处理 - 区分用户语音和 TTS 回声"""
+        # 静默期：TTS 开始后 300ms 内不做检测
         if self._tts_start_time > 0:
             elapsed = time.time() - self._tts_start_time
-            if elapsed < 0.5:  # 500ms 静默期
+            if elapsed < 0.3:
                 return
         
-        result = self.vad.process_for_interrupt(audio)
+        # 计算能量
+        samples = np.frombuffer(audio, dtype=np.int16)
+        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
         
-        if result.get('is_speech'):
+        # 使用 Silero VAD 检测是否是语音
+        result = self.vad.process_for_interrupt(audio)
+        speech_prob = result.get('speech_prob', 0)
+        is_speech = result.get('is_speech', False)
+        
+        # 只发送真正的语音给 ASR
+        if is_speech and speech_prob > 0.5:
             if self.asr.is_connected:
                 self.asr.send(audio)
         
-        if result.get('speech_start'):
-            logger.info("⚡ 打断触发！")
-            self._stop_playback.set()
+        # 打断条件：必须是语音 AND 概率足够高 AND 能量足够大
+        # 关键：TTS 回声通常是平稳的，用户说话会产生能量突变
+        if is_speech and speech_prob > 0.7:
+            logger.info(f"[打断检测] speech_prob={speech_prob:.2f}, energy={energy:.1f}")
+            
+            if result.get('speech_start'):
+                logger.info("⚡ 打断触发！")
+                self._stop_playback.set()
 
     def _tts_worker_loop(self):
         """TTS 播放工作线程"""
