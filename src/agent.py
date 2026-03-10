@@ -381,7 +381,18 @@ class FullDuplexAgent:
     
     def _handle_normal_vad(self, audio: bytes):
         """正常 VAD 处理"""
+        import numpy as np
+        
+        # 计算当前能量
+        samples = np.frombuffer(audio, dtype=np.int16)
+        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+        
         result = self.vad.process(audio)
+        
+        # 调试日志
+        if result.get('is_speech') or result.get('speech_start') or result.get('speech_end'):
+            logger.info(f"[VAD] energy={energy:.1f}, prob={result.get('speech_prob', 0):.3f}, "
+                       f"is_speech={result.get('is_speech')}, speech_end={result.get('speech_end')}")
         
         if result.get('is_speech'):
             self._audio_buffer.extend(audio)
