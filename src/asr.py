@@ -110,11 +110,12 @@ class SpeechRecognizer:
             
             def on_event(self, result: RecognitionResult):
                 try:
-                    logger.info(f"👂 ASR on_event 收到: {result}")
+                    logger.debug(f"👂 ASR on_event 收到: {result}")
                     sentence = result.get_sentence()
                     if sentence:
                         text = sentence.get('text', '')
-                        is_final = sentence.get('is_final', False)
+                        # 修复：检查 sentence_end 而不是 is_final
+                        is_final = sentence.get('sentence_end', False) or sentence.get('is_final', False)
                         
                         with recognizer._lock:
                             recognizer._partial_text = text
@@ -131,7 +132,7 @@ class SpeechRecognizer:
                             else:
                                 if recognizer._on_partial:
                                     recognizer._on_partial(text)
-                                logger.info(f"📝 ASR 临时结果: {text}")
+                                logger.debug(f"📝 ASR 临时结果: {text}")
                     else:
                         logger.debug(f"👂 ASR on_event 无 sentence")
                 
