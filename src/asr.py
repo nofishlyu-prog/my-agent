@@ -197,7 +197,8 @@ class SpeechRecognizer:
     
     def _send_audio_loop(self):
         """音频发送循环"""
-        logger.debug("🔊 ASR 音频发送线程启动")
+        logger.info("🔊 ASR 音频发送线程启动")
+        send_count = 0
         
         while self._running:
             try:
@@ -210,6 +211,9 @@ class SpeechRecognizer:
                     audio = self._audio_buffer.get(timeout=0.1)
                     if audio and self._recognizer:
                         self._recognizer.send_audio_frame(audio)
+                        send_count += 1
+                        if send_count % 50 == 0:  # 每 50 帧打印一次
+                            logger.info(f"ASR 已发送 {send_count} 帧音频")
                 except queue.Empty:
                     continue
                 except Exception as e:
@@ -220,18 +224,21 @@ class SpeechRecognizer:
                 logger.error(f"音频发送循环错误: {e}")
                 time.sleep(0.1)
         
-        logger.debug("🔊 ASR 音频发送线程结束")
+        logger.info(f"🔊 ASR 音频发送线程结束 (共发送 {send_count} 帧)")
     
     def send(self, audio: bytes):
         """发送音频数据"""
         if not self.is_connected:
+            logger.debug(f"ASR send: 未连接，跳过 {len(audio)} 字节")
             return
         
         try:
             # 非阻塞放入队列
             self._audio_buffer.put_nowait(audio)
+            logger.debug(f"ASR send: 放入队列 {len(audio)} 字节, 队列大小 {self._audio_buffer.qsize()}")
         except queue.Full:
             # 队列满，丢弃旧数据
+            logger.warning(f"ASR send: 队列满，丢弃旧数据")
             try:
                 self._audio_buffer.get_nowait()
                 self._audio_buffer.put_nowait(audio)
