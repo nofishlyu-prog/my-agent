@@ -344,6 +344,7 @@ class FullDuplexAgent:
     def _audio_input_loop(self):
         """音频输入主循环"""
         logger.info("🎧 音频输入线程启动")
+        last_log_time = time.time()
         
         while self._is_running:
             try:
@@ -367,8 +368,15 @@ class FullDuplexAgent:
                 
                 self._frame_count += 1
                 
+                # 定期输出心跳日志（确认音频输入线程在运行）
+                current_time = time.time()
+                if current_time - last_log_time > 1.0:
+                    logger.info(f"[音频心跳] frame={self._frame_count}, tts_playing={self._tts_playing.is_set()}")
+                    last_log_time = current_time
+                
                 # 根据当前状态处理
                 tts_playing = self._tts_playing.is_set()
+                
                 if tts_playing:
                     # TTS 播放中，确保 ASR 运行以支持打断
                     if not self.asr.is_connected:
