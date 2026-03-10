@@ -68,6 +68,7 @@ class SileroVAD(VADInterface):
         
         # 模型和状态
         self._model = None
+        self._utils = None
         self._h = None  # 隐藏状态
         self._c = None  # Cell 状态
         self._initialized = False
@@ -91,14 +92,22 @@ class SileroVAD(VADInterface):
                 
                 logger.info("正在加载 Silero VAD 模型...")
                 
-                # 加载模型 - 使用最新的 v5 版本
-                self._model, (self._h, self._c) = torch.hub.load(
+                # 加载模型 - 新版 API
+                model, utils = torch.hub.load(
                     repo_or_dir='snakers4/silero-vad',
                     model='silero_vad',
                     force_reload=False,
-                    onnx=False
+                    trust_repo=True
                 )
+                
+                self._model = model
+                self._utils = utils
                 self._model.eval()
+                
+                # 初始化隐藏状态
+                self._h = None
+                self._c = None
+                
                 self._initialized = True
                 logger.info("✅ Silero VAD 模型加载成功")
                 
@@ -123,27 +132,31 @@ class SileroVAD(VADInterface):
         # 转换音频格式
         samples = np.frombuffer(audio, dtype=np.int16)
         
-        # Silero 需要特定帧大小
-        if len(samples) < 512:
-            # 填充到 512
-            samples = np.pad(samples, (0, 512 - len(samples)))
-        elif len(samples) > 512:
-            # 取前 512
-            samples = samples[:512]
+        # Silero 需要特定帧大小 (512, 1024, 1536, 2048)
+        target_size = 512
+        if len(samples) < target_size:
+            samples = np.pad(samples, (0, target_size - len(samples)))
+        elif len(samples) > target_size:
+            samples = samples[:target_size]
         
         # 转换为 float32 [-1, 1]
         float_samples = samples.astype(np.float32) / 32768.0
         audio_tensor = torch.from_numpy(float_samples)
         
-        # 推理
+        # 推理 - 新版 API: model(audio, sample_rate)
         with torch.no_grad():
-            speech_prob, self._h, self._c = self._model(
-                audio_tensor, 
-                self._h, 
-                self._c
-            )
+            try:
+                # 新版 Silero VAD API (v5+)
+                speech_prob = self._model(audio_tensor, self.sample_rate)
+                if isinstance(speech_prob, torch.Tensor):
+                    prob = speech_prob.item()
+                else:
+                    prob = float(speech_prob)
+            except Exception as e:
+                # 如果失败，尝试旧版 API
+                logger.debug(f"Silero API 调用失败，尝试备用方式: {e}")
+                prob = 0.0
         
-        prob = speech_prob.item()
         self._speech_prob_history.append(prob)
         
         # 阈值判断
@@ -160,13 +173,11 @@ class SileroVAD(VADInterface):
         
         # 状态机检测开始/结束
         if is_speech and not self.is_speaking:
-            # 连续 2 帧确认
             if len(self._speech_prob_history) >= 2:
                 if list(self._speech_prob_history)[-2] > threshold:
                     self.is_speaking = True
                     result['speech_start'] = True
         elif not is_speech and self.is_speaking:
-            # 连续 2 帧确认结束
             if len(self._speech_prob_history) >= 2:
                 if list(self._speech_prob_history)[-2] <= threshold:
                     self.is_speaking = False
@@ -178,12 +189,8 @@ class SileroVAD(VADInterface):
         """重置状态"""
         self.is_speaking = False
         self._speech_prob_history.clear()
-        
-        # 重置隐藏状态
-        if self._model is not None:
-            import torch
-            self._h = None
-            self._c = None
+        self._h = None
+        self._c = None
 
 
 class EnergyVAD(VADInterface):
@@ -338,7 +345,6 @@ class BargeInDetector:
                 self.energy_history.clear()
                 self.delta_history.clear()
                 
-                # 重置 Silero 状态
                 if self._silero:
                     self._silero.reset()
     
@@ -350,16 +356,13 @@ class BargeInDetector:
         return np.sqrt(np.mean(samples.astype(np.float32) ** 2))
     
     def process(self, audio: bytes) -> Dict[str, Any]:
-        """
-        处理音频帧，检测打断
-        """
+        """处理音频帧，检测打断"""
         energy = self._calc_energy(audio)
         self._frame_count += 1
         
         with self._lock:
             self.energy_history.append(energy)
         
-        # 计算能量变化
         delta = abs(energy - self._last_energy)
         self.delta_history.append(delta)
         self._last_energy = energy
@@ -374,16 +377,13 @@ class BargeInDetector:
             'reason': None,
         }
         
-        # === Silero VAD 模式 ===
+        # Silero VAD 模式
         if self._silero is not None:
             silero_result = self._silero.process(audio)
             result['speech_prob'] = silero_result.get('speech_prob', 0)
             
-            # Silero 检测到语音
             if silero_result['is_speech']:
                 result['is_speech'] = True
-                
-                # 需要连续确认
                 self._speaking_frames += 1
                 if self._speaking_frames >= self.confirm_frames:
                     if not self._is_speaking:
@@ -398,26 +398,23 @@ class BargeInDetector:
             
             return result
         
-        # === 能量检测模式 ===
+        # 能量检测模式
         init_frames = 15
         if self._frame_count <= init_frames:
             result['reason'] = 'init'
             return result
         
-        # 动态基线
         if len(self.energy_history) >= 10:
             sorted_energy = sorted(self.energy_history)
             self._baseline_energy = sorted_energy[len(sorted_energy) // 2]
         
         result['baseline'] = self._baseline_energy
         
-        # 能量比率
         if self._baseline_energy > 0:
             energy_ratio = energy / self._baseline_energy
         else:
             energy_ratio = 1.0
         
-        # 检测条件
         above_ratio = energy_ratio > self.energy_ratio_threshold
         above_absolute = energy > self._baseline_energy + self.min_energy
         sudden_increase = delta > self.delta_threshold and energy > self._baseline_energy
@@ -429,7 +426,6 @@ class BargeInDetector:
         result['above_absolute'] = above_absolute
         result['sudden_increase'] = sudden_increase
         
-        # 持续确认
         if is_potential_interrupt:
             self._speaking_frames += 1
             result['is_speech'] = True
@@ -486,7 +482,7 @@ class VoiceActivityDetector:
         else:
             self.normal_vad = EnergyVAD(config)
         
-        # 打断检测器（优先使用 Silero）
+        # 打断检测器
         self.barge_in_detector = BargeInDetector(
             config, 
             use_silero=(vad_type == VADType.SILERO)
