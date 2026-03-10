@@ -3,6 +3,7 @@ dashscope>=1.20.0
 openai>=1.0.0
 pyaudio>=0.2.14
 numpy>=1.24.0
+packaging>=21.0
 
 # Silero VAD (推荐)
 torch>=2.0.0
