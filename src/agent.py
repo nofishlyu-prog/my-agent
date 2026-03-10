@@ -490,6 +490,11 @@ class FullDuplexAgent:
         self.vad.set_tts_playing(True)
         self.vad.barge_in_detector.set_tts_state(True)
         
+        # 启动 ASR 以支持打断检测
+        if not self.asr.is_connected:
+            logger.info("打断模式：启动 ASR")
+            self.asr.start()
+        
         interrupted = False
         
         try:
