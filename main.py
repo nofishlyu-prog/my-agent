@@ -17,10 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src import (
     Config,
-    FullDuplexAgent,
-    AudioDeviceManager,
-    IS_WINDOWS,
-    IS_MACOS
+    FullDuplexAgent
 )
 
 
@@ -45,7 +42,6 @@ def print_system_info():
     print("=" * 50)
     print(f"操作系统: {platform.system()} {platform.release()}")
     print(f"Python: {platform.python_version()}")
-    print(f"平台: {IS_WINDOWS and 'Windows' or IS_MACOS and 'macOS' or 'Other'}")
     print("=" * 50)
 
 
@@ -159,8 +155,16 @@ async def main():
     if args.devices:
         import pyaudio
         p = pyaudio.PyAudio()
-        manager = AudioDeviceManager(p)
-        manager.print_devices()
+        print("\n🎤 输入设备:")
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info['maxInputChannels'] > 0:
+                print(f"  [{i}] {info['name']}")
+        print("\n🔊 输出设备:")
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info['maxOutputChannels'] > 0:
+                print(f"  [{i}] {info['name']}")
         p.terminate()
         return
     
@@ -170,18 +174,15 @@ async def main():
         print("\n请选择模式：")
         print("1. 测试模式 (文字对话)")
         print("2. 语音对话")
-        print("3. 语音对话 (选择设备)")
         print()
         
         try:
-            choice = input("选择 [1/2/3]: ").strip()
+            choice = input("选择 [1/2]: ").strip()
         except EOFError:
             choice = '2'
         
         if choice == '1':
             await TestMode(config).run()
-        elif choice == '3':
-            await FullDuplexAgent(config).run(interactive=True)
         else:
             await FullDuplexAgent(config).run()
 
