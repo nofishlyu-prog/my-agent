@@ -370,6 +370,10 @@ class FullDuplexAgent:
                 # 根据当前状态处理
                 tts_playing = self._tts_playing.is_set()
                 if tts_playing:
+                    # TTS 播放中，确保 ASR 运行以支持打断
+                    if not self.asr.is_connected:
+                        logger.info("打断模式：重启 ASR")
+                        self.asr.start()
                     self._handle_interrupt_detection(audio_data)
                 else:
                     self._handle_normal_vad(audio_data)
