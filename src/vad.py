@@ -160,7 +160,7 @@ class SileroVAD(VADInterface):
         self._speech_prob_history.append(prob)
         
         # 阈值判断 - 降低阈值提高灵敏度
-        threshold = 0.3  # 从 0.5 降低到 0.3
+        threshold = 0.15  # 从 0.3 再降到 0.15，提高检测率
         is_speech = prob > threshold
         
         result = {
