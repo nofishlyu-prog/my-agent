@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 全双工语音对话智能体 - 主程序入口
+
+跨平台支持：Windows 和 macOS
 """
 
 import asyncio
 import logging
 import sys
 import argparse
+import platform
 from pathlib import Path
 
 # 添加 src 目录到路径
@@ -15,12 +18,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src import (
     Config,
     FullDuplexAgent,
-    LanguageModel,
-    TextToSpeech,
-    SemanticInterruptDetector
+    AudioDeviceManager,
+    IS_WINDOWS,
+    IS_MACOS
 )
 
-# 配置日志
+
 def setup_logging(debug: bool = False):
     """设置日志"""
     level = logging.DEBUG if debug else logging.INFO
@@ -32,6 +35,18 @@ def setup_logging(debug: bool = False):
     # 降低第三方库日志级别
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('dashscope').setLevel(logging.WARNING)
+    logging.getLogger('torch').setLevel(logging.WARNING)
+
+
+def print_system_info():
+    """打印系统信息"""
+    print("\n" + "=" * 50)
+    print("📋 系统信息")
+    print("=" * 50)
+    print(f"操作系统: {platform.system()} {platform.release()}")
+    print(f"Python: {platform.python_version()}")
+    print(f"平台: {IS_WINDOWS and 'Windows' or IS_MACOS and 'macOS' or 'Other'}")
+    print("=" * 50)
 
 
 class TestMode:
@@ -39,6 +54,7 @@ class TestMode:
 
     def __init__(self, config: Config):
         self.config = config
+        from src import LanguageModel, TextToSpeech, SemanticInterruptDetector
         self.llm = LanguageModel(config)
         self.tts = TextToSpeech(config)
         self.interrupt_detector = SemanticInterruptDetector(config)
@@ -125,30 +141,53 @@ async def main():
     parser = argparse.ArgumentParser(description='全双工语音对话智能体')
     parser.add_argument('--debug', action='store_true', help='启用调试模式')
     parser.add_argument('--test', action='store_true', help='运行测试模式')
+    parser.add_argument('--info', action='store_true', help='显示系统信息')
+    parser.add_argument('--devices', action='store_true', help='列出音频设备')
+    parser.add_argument('--interactive', action='store_true', help='交互式选择设备')
     args = parser.parse_args()
     
     setup_logging(args.debug)
     
     config = Config.from_json("config.json")
-
+    
+    # 显示系统信息
+    if args.info:
+        print_system_info()
+        return
+    
+    # 列出音频设备
+    if args.devices:
+        import pyaudio
+        p = pyaudio.PyAudio()
+        manager = AudioDeviceManager(p)
+        manager.print_devices()
+        p.terminate()
+        return
+    
     if args.test:
         await TestMode(config).run()
     else:
         print("\n请选择模式：")
         print("1. 测试模式 (文字对话)")
         print("2. 语音对话")
+        print("3. 语音对话 (选择设备)")
         print()
         
         try:
-            choice = input("选择 [1/2]: ").strip()
+            choice = input("选择 [1/2/3]: ").strip()
         except EOFError:
             choice = '2'
         
         if choice == '1':
             await TestMode(config).run()
+        elif choice == '3':
+            await FullDuplexAgent(config).run(interactive=True)
         else:
             await FullDuplexAgent(config).run()
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n👋 再见！")

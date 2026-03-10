@@ -1,6 +1,7 @@
 """
 全双工语音对话智能体
 架构：VAD → ASR → LLM → TTS
+跨平台支持：Windows 和 macOS
 """
 
 from .config import Config
@@ -10,7 +11,7 @@ from .asr import SpeechRecognizer
 from .llm import LanguageModel
 from .tts import TextToSpeech
 from .interrupt import SemanticInterruptDetector
-from .agent import FullDuplexAgent
+from .agent import FullDuplexAgent, AudioDeviceManager, AudioDevice, IS_WINDOWS, IS_MACOS
 
 __all__ = [
     'Config',
@@ -25,4 +26,8 @@ __all__ = [
     'TextToSpeech',
     'SemanticInterruptDetector',
     'FullDuplexAgent',
+    'AudioDeviceManager',
+    'AudioDevice',
+    'IS_WINDOWS',
+    'IS_MACOS',
 ]

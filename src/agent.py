@@ -1,19 +1,25 @@
 """
 全双工语音智能体模块
 
+跨平台支持：Windows 和 macOS
+
 架构改进：
 - 使用状态机清晰管理状态转换
 - 分离音频输入/输出线程
 - 改进打断检测和处理流程
 - 添加健壮的错误恢复机制
+- 跨平台音频设备管理
 """
 
 import asyncio
 import threading
 import time
 import logging
+import platform
+import sys
+from pathlib import Path
 from queue import Queue, Empty
-from typing import Optional, Callable
+from typing import Optional, Callable, List, Dict, Any
 from enum import Enum
 from dataclasses import dataclass
 
@@ -33,39 +39,107 @@ from .interrupt import SemanticInterruptDetector
 
 logger = logging.getLogger(__name__)
 
+# 平台检测
+IS_WINDOWS = platform.system() == 'Windows'
+IS_MACOS = platform.system() == 'Darwin'
+
 
 @dataclass
-class AudioChunk:
-    """音频数据块"""
-    data: bytes
-    timestamp: float
-    frame_num: int
+class AudioDevice:
+    """音频设备信息"""
+    index: int
+    name: str
+    channels: int
+    sample_rate: int
+    is_input: bool
+
+
+class AudioDeviceManager:
+    """
+    跨平台音频设备管理器
+    
+    处理 Windows 和 macOS 的音频设备差异
+    """
+    
+    def __init__(self, pyaudio_instance: pyaudio.PyAudio):
+        self._pyaudio = pyaudio_instance
+    
+    def list_input_devices(self) -> List[AudioDevice]:
+        """列出所有输入设备"""
+        devices = []
+        for i in range(self._pyaudio.get_device_count()):
+            info = self._pyaudio.get_device_info_by_index(i)
+            if info['maxInputChannels'] > 0:
+                devices.append(AudioDevice(
+                    index=i,
+                    name=info['name'],
+                    channels=info['maxInputChannels'],
+                    sample_rate=int(info['defaultSampleRate']),
+                    is_input=True
+                ))
+        return devices
+    
+    def list_output_devices(self) -> List[AudioDevice]:
+        """列出所有输出设备"""
+        devices = []
+        for i in range(self._pyaudio.get_device_count()):
+            info = self._pyaudio.get_device_info_by_index(i)
+            if info['maxOutputChannels'] > 0:
+                devices.append(AudioDevice(
+                    index=i,
+                    name=info['name'],
+                    channels=info['maxOutputChannels'],
+                    sample_rate=int(info['defaultSampleRate']),
+                    is_input=False
+                ))
+        return devices
+    
+    def get_default_input_device(self) -> Optional[AudioDevice]:
+        """获取默认输入设备"""
+        try:
+            info = self._pyaudio.get_default_input_device_info()
+            return AudioDevice(
+                index=info['index'],
+                name=info['name'],
+                channels=info['maxInputChannels'],
+                sample_rate=int(info['defaultSampleRate']),
+                is_input=True
+            )
+        except:
+            return None
+    
+    def get_default_output_device(self) -> Optional[AudioDevice]:
+        """获取默认输出设备"""
+        try:
+            info = self._pyaudio.get_default_output_device_info()
+            return AudioDevice(
+                index=info['index'],
+                name=info['name'],
+                channels=info['maxOutputChannels'],
+                sample_rate=int(info['defaultSampleRate']),
+                is_input=False
+            )
+        except:
+            return None
+    
+    def print_devices(self):
+        """打印所有设备信息"""
+        print("\n🎤 输入设备:")
+        for dev in self.list_input_devices():
+            default = " (默认)" if self.get_default_input_device() and self.get_default_input_device().index == dev.index else ""
+            print(f"  [{dev.index}] {dev.name}{default}")
+        
+        print("\n🔊 输出设备:")
+        for dev in self.list_output_devices():
+            default = " (默认)" if self.get_default_output_device() and self.get_default_output_device().index == dev.index else ""
+            print(f"  [{dev.index}] {dev.name}{default}")
 
 
 class FullDuplexAgent:
     """
     全双工语音对话智能体
     
-    架构：
-    ┌─────────────────────────────────────────────────┐
-    │                   主控制循环                      │
-    ├─────────────────────────────────────────────────┤
-    │  ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-    │  │ 音频输入  │───→│   VAD    │───→│   ASR    │  │
-    │  │  线程    │    │          │    │          │  │
-    │  └──────────┘    └────┬─────┘    └────┬─────┘  │
-    │                       │               │        │
-    │                       ▼               ▼        │
-    │               ┌──────────┐    ┌──────────┐    │
-    │               │ 打断检测  │    │   LLM   │    │
-    │               │          │    │         │    │
-    │               └────┬─────┘    └────┬────┘    │
-    │                    │               │         │
-    │                    ▼               ▼         │
-    │              ┌──────────┐    ┌──────────┐   │
-    │              │  TTS 控制 │←───│  输出队列 │   │
-    │              └──────────┘    └──────────┘   │
-    └─────────────────────────────────────────────────┘
+    跨平台支持：Windows 和 macOS
     """
     
     def __init__(self, config: Config = None):
@@ -84,6 +158,11 @@ class FullDuplexAgent:
         self._input_stream: Optional[pyaudio.Stream] = None
         self._output_stream: Optional[pyaudio.Stream] = None
         
+        # 设备管理
+        self._device_manager: Optional[AudioDeviceManager] = None
+        self._input_device_index: Optional[int] = None
+        self._output_device_index: Optional[int] = None
+        
         # 状态
         self.state = AgentState.IDLE
         self._is_running = False
@@ -100,12 +179,11 @@ class FullDuplexAgent:
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None
-        self._process_thread: Optional[threading.Thread] = None
         
         # 帧计数
         self._frame_count = 0
         
-        # 回调（可用于 UI 更新）
+        # 回调
         self._on_state_change: Optional[Callable[[AgentState], None]] = None
         self._on_user_text: Optional[Callable[[str], None]] = None
         self._on_assistant_text: Optional[Callable[[str], None]] = None
@@ -126,35 +204,130 @@ class FullDuplexAgent:
                 if self._on_state_change:
                     self._on_state_change(new_state)
     
-    def _init_audio(self):
+    def _get_platform_audio_params(self) -> Dict[str, Any]:
+        """
+        获取平台特定的音频参数
+        
+        Windows 和 macOS 可能需要不同的参数
+        """
+        params = {
+            'input_format': pyaudio.paInt16,
+            'output_format': pyaudio.paInt16,
+            'input_frames_per_buffer': int(self.config.sample_rate * 0.03),  # 30ms
+            'output_frames_per_buffer': 1024,
+        }
+        
+        if IS_WINDOWS:
+            # Windows 可能需要更大的缓冲区
+            params['input_frames_per_buffer'] = 1024
+            params['output_frames_per_buffer'] = 2048
+        elif IS_MACOS:
+            # macOS Core Audio 喜欢较小的缓冲区
+            params['input_frames_per_buffer'] = 480  # 30ms at 16kHz
+            params['output_frames_per_buffer'] = 512
+        
+        return params
+    
+    def _init_audio(self) -> bool:
         """初始化音频设备"""
         try:
+            # 创建 PyAudio 实例
             self._pyaudio_in = pyaudio.PyAudio()
             self._pyaudio_out = pyaudio.PyAudio()
-            logger.info("✅ 音频设备初始化成功")
+            
+            # 设备管理器
+            self._device_manager = AudioDeviceManager(self._pyaudio_in)
+            
+            # 获取默认设备
+            default_in = self._device_manager.get_default_input_device()
+            default_out = self._device_manager.get_default_output_device()
+            
+            if default_in:
+                self._input_device_index = default_in.index
+                logger.info(f"输入设备: {default_in.name}")
+            else:
+                logger.warning("未找到输入设备")
+                return False
+            
+            if default_out:
+                self._output_device_index = default_out.index
+                logger.info(f"输出设备: {default_out.name}")
+            else:
+                logger.warning("未找到输出设备")
+                return False
+            
+            logger.info(f"✅ 音频设备初始化成功 ({platform.system()})")
             return True
+            
         except Exception as e:
             logger.error(f"❌ 音频设备初始化失败: {e}")
             return False
     
-    def _start_input_stream(self):
+    def select_devices(self):
+        """交互式选择音频设备"""
+        if not self._device_manager:
+            print("请先初始化音频系统")
+            return
+        
+        self._device_manager.print_devices()
+        
+        # 选择输入设备
+        try:
+            in_idx = input("\n选择输入设备编号 (回车使用默认): ").strip()
+            if in_idx:
+                self._input_device_index = int(in_idx)
+        except:
+            pass
+        
+        # 选择输出设备
+        try:
+            out_idx = input("选择输出设备编号 (回车使用默认): ").strip()
+            if out_idx:
+                self._output_device_index = int(out_idx)
+        except:
+            pass
+    
+    def _start_input_stream(self) -> bool:
         """启动麦克风输入流"""
         if self._input_stream is not None:
             return True
         
         try:
+            params = self._get_platform_audio_params()
+            
             self._input_stream = self._pyaudio_in.open(
                 rate=self.config.sample_rate,
                 channels=self.config.channels,
-                format=pyaudio.paInt16,
+                format=params['input_format'],
                 input=True,
-                frames_per_buffer=int(self.config.sample_rate * 0.03),  # 30ms
+                input_device_index=self._input_device_index,
+                frames_per_buffer=params['input_frames_per_buffer'],
                 stream_callback=None
             )
-            logger.info("🎤 麦克风输入流已启动")
+            
+            logger.info(f"🎤 麦克风输入流已启动 (缓冲区: {params['input_frames_per_buffer']})")
             return True
+            
         except Exception as e:
             logger.error(f"❌ 启动麦克风失败: {e}")
+            
+            # Windows 特殊处理：尝试不同的缓冲区大小
+            if IS_WINDOWS:
+                for buf_size in [512, 1024, 2048, 4096]:
+                    try:
+                        self._input_stream = self._pyaudio_in.open(
+                            rate=self.config.sample_rate,
+                            channels=self.config.channels,
+                            format=pyaudio.paInt16,
+                            input=True,
+                            input_device_index=self._input_device_index,
+                            frames_per_buffer=buf_size
+                        )
+                        logger.info(f"🎤 麦克风输入流已启动 (缓冲区: {buf_size})")
+                        return True
+                    except:
+                        continue
+            
             return False
     
     def _stop_input_stream(self):
@@ -174,7 +347,6 @@ class FullDuplexAgent:
         
         while self._is_running:
             try:
-                # 确保输入流存在
                 if self._input_stream is None:
                     if not self._start_input_stream():
                         time.sleep(0.5)
@@ -182,10 +354,12 @@ class FullDuplexAgent:
                 
                 # 读取音频
                 try:
-                    chunk_size = int(self.config.sample_rate * 0.03)  # 30ms
+                    params = self._get_platform_audio_params()
+                    chunk_size = params['input_frames_per_buffer']
                     audio_data = self._input_stream.read(chunk_size, exception_on_overflow=False)
                 except OSError as e:
-                    if "Stream closed" in str(e) or "Invalid stream" in str(e):
+                    error_msg = str(e)
+                    if "Stream closed" in error_msg or "Invalid stream" in error_msg or "Unanticipated host error" in error_msg:
                         self._input_stream = None
                         time.sleep(0.1)
                         continue
@@ -195,10 +369,8 @@ class FullDuplexAgent:
                 
                 # 根据当前状态处理
                 if self._tts_playing.is_set():
-                    # TTS 播放中 - 打断检测模式
                     self._handle_interrupt_detection(audio_data)
                 else:
-                    # 正常模式
                     self._handle_normal_vad(audio_data)
             
             except Exception as e:
@@ -218,15 +390,13 @@ class FullDuplexAgent:
             self._set_state(AgentState.LISTENING)
         
         elif result.get('speech_end') and len(self._audio_buffer) > 0:
-            # 语音结束，处理对话
             self._set_state(AgentState.THINKING)
-            time.sleep(0.3)  # 等待 ASR 完成
+            time.sleep(0.3)
             
             self.asr.stop()
             self._process_user_input()
             self.asr.start()
             
-            # 重置
             self._audio_buffer = bytearray()
             self.vad.normal_vad.reset()
     
@@ -234,23 +404,18 @@ class FullDuplexAgent:
         """打断检测处理"""
         result = self.vad.process_for_interrupt(audio)
         
-        # 调试日志
         if self._frame_count % 20 == 0 or result.get('speech_start'):
             logger.debug(
                 f"[打断检测] frame={self._frame_count}, "
-                f"energy={result.get('energy', 0):.1f}, "
-                f"baseline={result.get('baseline', 0):.1f}, "
-                f"ratio={result.get('energy_ratio', 0):.2f}, "
+                f"prob={result.get('speech_prob', 0):.2f}, "
                 f"is_speech={result.get('is_speech')}"
             )
         
-        # 检测到语音
         if result.get('is_speech'):
             self._interrupt_audio.extend(audio)
             if self.asr.is_connected:
                 self.asr.send(audio)
         
-        # 触发打断
         if result.get('speech_start'):
             logger.info(f"⚡ 打断触发！")
             self._should_interrupt.set()
@@ -271,7 +436,6 @@ class FullDuplexAgent:
         if self._on_user_text:
             self._on_user_text(user_text)
         
-        # 获取回复
         self._set_state(AgentState.THINKING)
         response = self.llm.chat(user_text)
         
@@ -287,45 +451,40 @@ class FullDuplexAgent:
     
     def _play_response(self, text: str):
         """播放 TTS 响应"""
-        # 合成语音
         audio = self.tts.synthesize(text)
         if not audio:
             self._set_state(AgentState.IDLE)
             return
         
-        # 跳过 WAV 头
         if len(audio) > 44 and audio[:4] == b'RIFF':
             audio = audio[44:]
         
         logger.info(f"🔊 播放 TTS ({len(audio)} 字节)")
         
-        # 设置状态
         self._set_state(AgentState.SPEAKING)
         self._tts_playing.set()
         self._stop_playback.clear()
         self._should_interrupt.clear()
         self._interrupt_audio = bytearray()
         self.vad.set_tts_playing(True)
-        
-        # 初始化打断检测器
         self.vad.barge_in_detector.set_tts_state(True)
         
         interrupted = False
         
         try:
-            # 创建输出流
+            params = self._get_platform_audio_params()
+            
             stream = self._pyaudio_out.open(
                 rate=self.config.tts_sample_rate,
                 channels=1,
-                format=pyaudio.paInt16,
+                format=params['output_format'],
                 output=True,
-                frames_per_buffer=1024
+                output_device_index=self._output_device_index,
+                frames_per_buffer=params['output_frames_per_buffer']
             )
             
-            # 播放
-            chunk_size = 1024
+            chunk_size = params['output_frames_per_buffer']
             for i in range(0, len(audio), chunk_size):
-                # 检查打断
                 if self._stop_playback.is_set():
                     logger.info("⚡ TTS 被打断")
                     interrupted = True
@@ -334,15 +493,13 @@ class FullDuplexAgent:
                 chunk = audio[i:i + chunk_size]
                 stream.write(chunk, exception_on_underflow=False)
             
-            # 清理
             stream.stop_stream()
             stream.close()
-        
+            
         except Exception as e:
             logger.error(f"播放错误: {e}")
         
         finally:
-            # 重置状态
             self._tts_playing.clear()
             self._stop_playback.clear()
             self.vad.set_tts_playing(False)
@@ -358,12 +515,10 @@ class FullDuplexAgent:
         logger.info("处理打断...")
         self._should_interrupt.clear()
         
-        # 等待 ASR 完成
         time.sleep(0.5)
         self.asr.stop()
         time.sleep(0.2)
         
-        # 获取识别结果
         user_text = self.asr.get_result(timeout=0.3)
         if not user_text:
             user_text = self.asr.get_partial_text()
@@ -389,27 +544,37 @@ class FullDuplexAgent:
             self.asr.start()
             self._set_state(AgentState.IDLE)
     
-    async def run(self):
-        """运行智能体"""
+    async def run(self, interactive: bool = False):
+        """
+        运行智能体
+        
+        Args:
+            interactive: 是否交互式选择设备
+        """
         print("=" * 60)
-        print("🎙️  全双工语音对话智能体 v2.1")
+        print(f"🎙️  全双工语音对话智能体 v2.2")
+        print(f"🖥️  平台: {platform.system()} {platform.release()}")
         print("=" * 60)
         print(f"📦 模型: {self.config.llm_model}")
         print(f"🎵 音色: {self.config.tts_voice}")
+        print(f"🎤 VAD: {self.vad.vad_name}")
         print(f"⚡ 打断检测: {'启用' if self.config.barge_in_enabled else '禁用'}")
         print("-" * 60)
         print("💡 提示:")
         print("   - 说话后停顿 0.5 秒自动提交")
         print("   - TTS 播放时可说话打断")
-        print("   - 打断时需要说话声音足够大")
         print("-" * 60)
         print("🛑 Ctrl+C 退出")
         print("=" * 60)
         
-        # 初始化
+        # 初始化音频
         if not self._init_audio():
             print("❌ 音频设备初始化失败")
             return
+        
+        # 交互式选择设备
+        if interactive:
+            self.select_devices()
         
         # 启动 ASR
         if not self.asr.start():
@@ -445,9 +610,15 @@ class FullDuplexAgent:
         self.asr.stop()
         
         if self._pyaudio_in:
-            self._pyaudio_in.terminate()
+            try:
+                self._pyaudio_in.terminate()
+            except:
+                pass
         if self._pyaudio_out:
-            self._pyaudio_out.terminate()
+            try:
+                self._pyaudio_out.terminate()
+            except:
+                pass
         
         logger.info("资源清理完成")
     
