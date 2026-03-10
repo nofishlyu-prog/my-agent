@@ -110,6 +110,7 @@ class SpeechRecognizer:
             
             def on_event(self, result: RecognitionResult):
                 try:
+                    logger.info(f"👂 ASR on_event 收到: {result}")
                     sentence = result.get_sentence()
                     if sentence:
                         text = sentence.get('text', '')
@@ -126,13 +127,13 @@ class SpeechRecognizer:
                                 recognizer._result_queue.put(ASRResult(text=text, is_final=True))
                                 if recognizer._on_final:
                                     recognizer._on_final(text)
+                                logger.info(f"📝 ASR 最终结果: {text}")
                             else:
                                 if recognizer._on_partial:
                                     recognizer._on_partial(text)
-                        
-                        # 日志
-                        status = "最终" if is_final else "临时"
-                        logger.debug(f"👂 [{status}] {text}")
+                                logger.info(f"📝 ASR 临时结果: {text}")
+                    else:
+                        logger.debug(f"👂 ASR on_event 无 sentence")
                 
                 except Exception as e:
                     logger.error(f"ASR 事件处理错误: {e}")
