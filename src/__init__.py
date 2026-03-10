@@ -11,6 +11,7 @@ from .asr import SpeechRecognizer
 from .llm import LanguageModel
 from .tts import TextToSpeech
 from .interrupt import SemanticInterruptDetector
+from .aec import AECProcessor, SimpleAEC, NLMSFilter
 from .agent import FullDuplexAgent
 
 __all__ = [
@@ -25,5 +26,8 @@ __all__ = [
     'LanguageModel',
     'TextToSpeech',
     'SemanticInterruptDetector',
+    'AECProcessor',
+    'SimpleAEC',
+    'NLMSFilter',
     'FullDuplexAgent',
 ]

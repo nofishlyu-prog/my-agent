@@ -30,6 +30,7 @@ from .vad import VoiceActivityDetector, BargeInDetector
 from .asr import SpeechRecognizer
 from .llm import LanguageModel
 from .tts import TextToSpeech
+from .aec import SimpleAEC
 from .interrupt import SemanticInterruptDetector
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,12 @@ class FullDuplexAgent:
         self.asr = SpeechRecognizer(self.config)
         self.llm = LanguageModel(self.config)
         self.tts = TextToSpeech(self.config)
+        
+        # 回声消除
+        self.aec = SimpleAEC(
+            sample_rate=self.config.sample_rate,
+            echo_suppression=0.8  # 80% 回声抑制
+        )
         
         # PyAudio
         self._pyaudio_in: Optional[pyaudio.PyAudio] = None
@@ -214,29 +221,33 @@ class FullDuplexAgent:
             self._set_state(AgentState.IDLE)
 
     def _handle_interrupt_detection(self, audio: bytes):
-        """打断检测处理 - 区分用户语音和 TTS 回声"""
-        # 静默期：TTS 开始后 300ms 内不做检测
+        """打断检测处理 - 使用 AEC 消除回声"""
+        # 静默期：TTS 开始后 200ms 内不做检测
         if self._tts_start_time > 0:
             elapsed = time.time() - self._tts_start_time
-            if elapsed < 0.3:
+            if elapsed < 0.2:
                 return
         
+        # 使用 AEC 消除回声
+        # 注意：这里我们没有实时的 TTS 参考信号
+        # SimpleAEC 使用能量估计来抑制回声
+        clean_audio = self.aec.suppress_echo(audio)
+        
         # 计算能量
-        samples = np.frombuffer(audio, dtype=np.int16)
+        samples = np.frombuffer(clean_audio, dtype=np.int16)
         energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
         
         # 使用 Silero VAD 检测是否是语音
-        result = self.vad.process_for_interrupt(audio)
+        result = self.vad.process_for_interrupt(clean_audio)
         speech_prob = result.get('speech_prob', 0)
         is_speech = result.get('is_speech', False)
         
         # 只发送真正的语音给 ASR
         if is_speech and speech_prob > 0.5:
             if self.asr.is_connected:
-                self.asr.send(audio)
+                self.asr.send(clean_audio)
         
-        # 打断条件：必须是语音 AND 概率足够高 AND 能量足够大
-        # 关键：TTS 回声通常是平稳的，用户说话会产生能量突变
+        # 打断条件：必须是语音 AND 概率足够高
         if is_speech and speech_prob > 0.7:
             logger.info(f"[打断检测] speech_prob={speech_prob:.2f}, energy={energy:.1f}")
             
@@ -286,6 +297,9 @@ class FullDuplexAgent:
         if not self.asr.is_connected:
             self.asr.start()
         
+        # 重置 AEC
+        self.aec.reset()
+        
         try:
             stream = self._pyaudio_out.open(
                 rate=self.config.tts_sample_rate,
@@ -306,6 +320,9 @@ class FullDuplexAgent:
                 
                 chunk = audio[i:i + chunk_size]
                 stream.write(chunk, exception_on_underflow=False)
+                
+                # 更新 AEC 的 TTS 能量估计
+                self.aec.update_tts_energy(chunk)
             
             stream.stop_stream()
             stream.close()
