@@ -4,12 +4,9 @@ openai>=1.0.0
 pyaudio>=0.2.14
 numpy>=1.24.0
 
-# VAD - Silero (推荐)
+# Silero VAD (推荐)
 torch>=2.0.0
 torchaudio>=2.0.0
-
-# 回声消除 (可选，需要系统支持)
-# py-webrtcvad>=1.0.0
 
 # 异步支持
 aiohttp>=3.9.0

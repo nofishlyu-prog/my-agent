@@ -5,7 +5,7 @@
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +21,18 @@ class Config:
     chunk_size: int = 960  # 60ms at 16kHz
     channels: int = 1
 
-    # VAD 参数（正常模式）
-    vad_threshold: int = 100  # 能量阈值
+    # VAD 参数
+    vad_type: str = "silero"  # "silero" 或 "energy"
+    vad_threshold: int = 100  # 能量阈值（energy 模式）
     vad_silence_ms: int = 500  # 静音检测时长
     vad_speech_ms: int = 200   # 语音确认时长
 
     # 打断检测参数（全双工模式）
     barge_in_enabled: bool = True
-    barge_in_baseline_frames: int = 20      # 基线估计帧数
-    barge_in_confirm_frames: int = 3        # 确认帧数
-    barge_in_min_increment: int = 80        # 最小能量增量
-    barge_in_ratio_threshold: float = 1.3   # 能量比率阈值（比基线高 30%）
+    barge_in_baseline_frames: int = 15      # 基线估计帧数
+    barge_in_confirm_frames: int = 2        # 确认帧数
+    barge_in_min_increment: int = 100       # 最小能量增量
+    barge_in_ratio_threshold: float = 1.5   # 能量比率阈值
 
     # ASR 参数
     asr_model: str = "paraformer-realtime-v2"
@@ -81,12 +82,14 @@ class Config:
 
     def to_json(self, path: str = "config.json"):
         """保存配置到 JSON 文件"""
-        import json
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({
                 'api_key': self.api_key,
                 'sample_rate': self.sample_rate,
+                'vad_type': self.vad_type,
                 'vad_threshold': self.vad_threshold,
+                'vad_silence_ms': self.vad_silence_ms,
+                'vad_speech_ms': self.vad_speech_ms,
                 'barge_in_enabled': self.barge_in_enabled,
                 'barge_in_baseline_frames': self.barge_in_baseline_frames,
                 'barge_in_confirm_frames': self.barge_in_confirm_frames,
