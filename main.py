@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import sys
+import argparse
 from pathlib import Path
 
 # 添加 src 目录到路径
@@ -20,12 +21,17 @@ from src import (
 )
 
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+def setup_logging(debug: bool = False):
+    """设置日志"""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='[%(asctime)s] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    # 降低第三方库日志级别
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('dashscope').setLevel(logging.WARNING)
 
 
 class TestMode:
@@ -57,13 +63,13 @@ class TestMode:
             stream.close()
             p.terminate()
         except Exception as e:
-            logger.error(f"播放错误：{e}")
+            logging.error(f"播放错误：{e}")
 
     async def run(self):
         """运行测试模式"""
-        print("=" * 70)
-        print("🧪 测试模式 - Qwen3-Omni")
-        print("=" * 70)
+        print("=" * 60)
+        print("🧪 测试模式")
+        print("=" * 60)
 
         # 语义打断测试
         print("\n📊 语义打断测试：")
@@ -116,22 +122,32 @@ class TestMode:
 
 async def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description='全双工语音对话智能体')
+    parser.add_argument('--debug', action='store_true', help='启用调试模式')
+    parser.add_argument('--test', action='store_true', help='运行测试模式')
+    args = parser.parse_args()
+    
+    setup_logging(args.debug)
+    
     config = Config.from_json("config.json")
 
-    print("\n" + "=" * 70)
-    print("🎙️  全双工语音对话智能体")
-    print("=" * 70)
-    print(f"\n当前模型：{config.llm_model}")
-    print(f"VAD 阈值：{config.vad_threshold}")
-    print("\n1. 测试模式 (文字)")
-    print("2. 语音对话\n")
-
-    choice = input("选择：").strip()
-
-    if choice == '1':
+    if args.test:
         await TestMode(config).run()
     else:
-        await FullDuplexAgent(config).run()
+        print("\n请选择模式：")
+        print("1. 测试模式 (文字对话)")
+        print("2. 语音对话")
+        print()
+        
+        try:
+            choice = input("选择 [1/2]: ").strip()
+        except EOFError:
+            choice = '2'
+        
+        if choice == '1':
+            await TestMode(config).run()
+        else:
+            await FullDuplexAgent(config).run()
 
 
 if __name__ == '__main__':

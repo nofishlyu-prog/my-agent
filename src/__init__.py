@@ -5,7 +5,7 @@
 
 from .config import Config
 from .state import AgentState
-from .vad import VoiceActivityDetector
+from .vad import VoiceActivityDetector, BargeInDetector, BargeInDetector
 from .asr import SpeechRecognizer
 from .llm import LanguageModel
 from .tts import TextToSpeech
@@ -16,6 +16,7 @@ __all__ = [
     'Config',
     'AgentState',
     'VoiceActivityDetector',
+    'BargeInDetector',
     'SpeechRecognizer',
     'LanguageModel',
     'TextToSpeech',
