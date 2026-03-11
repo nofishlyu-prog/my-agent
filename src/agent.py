@@ -455,15 +455,21 @@ class FullDuplexAgent:
         """处理打断"""
         logger.info("处理打断...")
         
+        # 清除打断标志
+        self._stop_playback.clear()
+        
         # 等待 ASR 完成
-        time.sleep(0.3)
+        time.sleep(0.5)
         self.asr.stop()
+        time.sleep(0.2)
         
+        # 获取新识别的结果
         user_text = self.asr.get_result(timeout=0.3)
-        if not user_text:
-            user_text = self.asr.get_partial_text()
         
-        if user_text:
+        # 清空 partial text，避免下次误用
+        self.asr.clear()
+        
+        if user_text and user_text.strip():
             user_text = self._clean_asr_text(user_text)
         
         if user_text:
@@ -477,7 +483,7 @@ class FullDuplexAgent:
                 print(f"🤖 助手: {response}")
                 self._tts_queue.put(response)
         else:
-            logger.info("打断但未识别到语音")
+            logger.info("打断但未识别到新语音")
             self.asr.start()
 
     async def run(self):
