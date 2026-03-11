@@ -191,8 +191,6 @@ class FullDuplexAgent:
     def _detect_interrupt(self, audio: bytes):
         """
         打断检测 - 使用 Silero VAD
-        
-        关键：直接使用已加载的 VAD，不重新创建
         """
         self._tts_frame_count += 1
         
@@ -200,12 +198,15 @@ class FullDuplexAgent:
         if self._tts_frame_count <= self._tts_grace_period:
             return
         
-        # 直接使用 SileroVAD 的 process 方法，不用 BargeInDetector
-        # 因为 BargeInDetector 会重新创建 VAD 实例
+        # 直接使用 SileroVAD 的 process 方法
         vad_result = self.vad.normal_vad.process(audio)
         
         speech_prob = vad_result.get('speech_prob', 0)
         is_speech = vad_result.get('is_speech', False)
+        
+        # 添加调试日志
+        if speech_prob > 0.3:
+            logger.info(f"[打断] prob={speech_prob:.2f}, is_speech={is_speech}, frames={self._interrupt_speech_frames}")
         
         # 条件：概率 > 0.6 且被识别为语音
         if is_speech and speech_prob > 0.6:
