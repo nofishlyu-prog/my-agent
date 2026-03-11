@@ -86,10 +86,10 @@ class FullDuplexAgent:
         
         # 打断检测状态
         self._interrupt_speech_frames = 0
-        self._interrupt_threshold = 5
+        self._interrupt_threshold = 8  # 需要8帧确认
         self._tts_frame_count = 0
-        self._tts_grace_period = 20  # 20帧静默期
-        self._interrupt_prob_threshold = 0.7
+        self._tts_grace_period = 25  # 静默期25帧
+        self._interrupt_prob_threshold = 0.85  # 概率阈值0.85
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None

@@ -299,9 +299,17 @@ class SpeechRecognizer:
             self._partial_text = ""
             self._final_text = ""
         
+        # 清空结果队列
         while not self._result_queue.empty():
             try:
                 self._result_queue.get_nowait()
+            except:
+                break
+        
+        # 清空音频缓冲
+        while not self._audio_buffer.empty():
+            try:
+                self._audio_buffer.get_nowait()
             except:
                 break
     
