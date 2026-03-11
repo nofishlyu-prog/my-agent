@@ -76,6 +76,7 @@ class FullDuplexAgent:
         self._tts_playing = threading.Event()
         self._stop_playback = threading.Event()
         self._tts_start_time = 0
+        self._tts_end_time = 0  # TTS 结束时间
         self._tts_thread: Optional[threading.Thread] = None
         self._tts_queue = Queue(maxsize=5)
         
@@ -193,6 +194,12 @@ class FullDuplexAgent:
 
     def _handle_normal_vad(self, audio: bytes):
         """正常 VAD 处理"""
+        # 检查是否在 TTS 播放后的抑制期内
+        if self._tts_end_time > 0:
+            elapsed = time.time() - self._tts_end_time
+            if elapsed < 1.5:  # TTS 结束后 1.5 秒内抑制
+                return
+        
         result = self.vad.process(audio)
         
         if result.get('is_speech'):
@@ -392,6 +399,7 @@ class FullDuplexAgent:
         finally:
             self._tts_playing.clear()
             self._tts_start_time = 0
+            self._tts_end_time = time.time()  # 记录结束时间
             self._stop_playback.clear()
             self.vad.set_tts_playing(False)
             self.vad.barge_in_detector.set_tts_state(False)
