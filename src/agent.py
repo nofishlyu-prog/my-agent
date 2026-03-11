@@ -64,6 +64,13 @@ class FullDuplexAgent:
         self._tts_playing = threading.Event()
         self._stop_playback = threading.Event()
         
+        # 打断检测状态
+        self._tts_energy_baseline = 0.0  # TTS 回声能量基线
+        self._tts_energy_count = 0  # 用于计算基线
+        self._interrupt_frames = 0  # 连续检测到用户语音的帧数
+        self._interrupt_threshold_frames = 8  # 需要连续 8 帧确认（约 240ms）
+        self._last_interrupt_energy = 0.0
+        
         # 音频缓冲
         self._audio_buffer = bytearray()
         
@@ -162,10 +169,10 @@ class FullDuplexAgent:
                     logger.info(f"[心跳] frame={self._frame_count}, tts_playing={tts_state}")
                     last_heartbeat = time.time()
                 
-                # 核心逻辑：TTS 播放期间完全不处理音频
+                # 根据当前状态处理
                 if self._tts_playing.is_set():
-                    # TTS 播放中，跳过所有音频处理
-                    continue
+                    # TTS 播放期间：检测打断
+                    self._handle_interrupt_detection(audio_data)
                 else:
                     # 正常语音检测
                     self._handle_normal_vad(audio_data)
@@ -209,6 +216,63 @@ class FullDuplexAgent:
             self.asr.start()
             self._set_state(AgentState.IDLE)
 
+    def _handle_interrupt_detection(self, audio: bytes):
+        """
+        TTS 播放期间的打断检测
+        
+        核心原理：
+        - TTS 播放时，麦克风捕获的是"回声"
+        - 用户说话时，麦克风捕获的是"回声 + 用户声音"
+        - 所以用户说话时能量会显著增加
+        
+        策略：
+        1. 跟踪回声能量基线
+        2. 检测能量是否显著超过基线（需要增加 50% 以上）
+        3. 连续确认多帧才触发打断
+        """
+        # 计算当前能量
+        samples = np.frombuffer(audio, dtype=np.int16)
+        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+        
+        # 更新基线（使用指数平滑）
+        if self._tts_energy_count < 10:
+            # 初始化阶段
+            self._tts_energy_baseline = energy
+            self._tts_energy_count += 1
+            self._last_interrupt_energy = energy
+            return
+        else:
+            # 平滑更新基线（较慢的更新速度）
+            alpha = 0.05  # 基线更新慢一点
+            self._tts_energy_baseline = alpha * energy + (1 - alpha) * self._tts_energy_baseline
+        
+        # 计算能量增量
+        energy_increase = energy - self._tts_energy_baseline
+        energy_ratio = energy / self._tts_energy_baseline if self._tts_energy_baseline > 0 else 1.0
+        
+        # 检测条件：能量需要显著高于基线
+        # 条件1：能量比率 > 1.4 (比基线高 40%)
+        # 条件2：绝对增量 > 100 (有实际的声音增加)
+        is_user_speaking = energy_ratio > 1.4 and energy_increase > 100
+        
+        if is_user_speaking:
+            self._interrupt_frames += 1
+            
+            # 发送音频给 ASR（用于识别打断内容）
+            if self.asr.is_connected:
+                self.asr.send(audio)
+            
+            # 需要连续确认
+            if self._interrupt_frames >= self._interrupt_threshold_frames:
+                logger.info(f"⚡ 打断触发！ratio={energy_ratio:.2f}, increase={energy_increase:.1f}")
+                self._stop_playback.set()
+                self._interrupt_frames = 0
+        else:
+            # 重置计数
+            self._interrupt_frames = 0
+        
+        self._last_interrupt_energy = energy
+
     def _tts_worker_loop(self):
         """TTS 播放工作线程"""
         logger.info("🔊 TTS 工作线程启动")
@@ -244,6 +308,15 @@ class FullDuplexAgent:
         self._set_state(AgentState.SPEAKING)
         self._tts_playing.set()
         self._stop_playback.clear()
+        
+        # 重置打断检测状态
+        self._tts_energy_baseline = 0.0
+        self._tts_energy_count = 0
+        self._interrupt_frames = 0
+        
+        # 确保 ASR 运行
+        if not self.asr.is_connected:
+            self.asr.start()
         
         try:
             stream = self._pyaudio_out.open(
