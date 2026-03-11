@@ -83,8 +83,10 @@ class FullDuplexAgent:
         self._tts_energy_baseline = 0.0
         self._tts_frames = 0
         self._interrupt_frames = 0
-        self._interrupt_threshold = 6  # 连续6帧(~180ms)确认打断
+        self._interrupt_threshold = 8  # 连续8帧(~240ms)确认打断
         self._min_silence_ms = 300  # 0.3秒静音触发回复
+        self._tts_start_time = 0  # TTS开始时间
+        self._silence_period = 0.5  # TTS开始后0.5秒内不检测打断
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None
@@ -190,28 +192,37 @@ class FullDuplexAgent:
         """
         打断检测 - 基于能量突变
         
-        原理：用户说话时，麦克风捕获 = TTS回声 + 用户声音
-        能量会显著增加
+        关键改进：
+        1. TTS开始后0.5秒静默期，不检测
+        2. 静默期后建立能量基线
+        3. 检测能量显著增加才触发
         """
+        # 静默期检查
+        if self._tts_start_time > 0:
+            elapsed = time.time() - self._tts_start_time
+            if elapsed < self._silence_period:
+                # 静默期内，不检测
+                return
+        
         samples = np.frombuffer(audio, dtype=np.int16)
         energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
         
-        # 更新基线
-        if self._tts_frames < 10:
+        # 基线建立阶段（静默期后20帧）
+        if self._tts_frames < 20:
             self._tts_energy_baseline = energy
             self._tts_frames += 1
             return
         
         # 慢速更新基线
-        alpha = 0.03
+        alpha = 0.02  # 更慢的更新速度
         self._tts_energy_baseline = alpha * energy + (1-alpha) * self._tts_energy_baseline
         
         # 检测突变
         ratio = energy / self._tts_energy_baseline if self._tts_energy_baseline > 0 else 1.0
         increase = energy - self._tts_energy_baseline
         
-        # 条件：比率>1.5 且 增量>150
-        if ratio > 1.5 and increase > 150:
+        # 提高阈值：比率>1.8 且 增量>200
+        if ratio > 1.8 and increase > 200:
             self._interrupt_frames += 1
             if self._interrupt_frames >= self._interrupt_threshold:
                 logger.info(f"⚡ 打断: ratio={ratio:.2f}, increase={increase:.0f}")
@@ -382,7 +393,8 @@ class FullDuplexAgent:
         self._tts_playing.set()
         self._stop_playback.clear()
         
-        # 重置打断检测
+        # 重置打断检测 - 关键：设置开始时间
+        self._tts_start_time = time.time()
         self._tts_energy_baseline = 0
         self._tts_frames = 0
         self._interrupt_frames = 0
@@ -414,6 +426,7 @@ class FullDuplexAgent:
             logger.error(f"播放错误: {e}")
         finally:
             self._tts_playing.clear()
+            self._tts_start_time = 0
             self._stop_playback.clear()
             self._set_state(AgentState.IDLE)
 
