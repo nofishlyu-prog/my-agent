@@ -80,6 +80,12 @@ class FullDuplexAgent:
         self._frame_count = 0
         self._min_silence_ms = 300  # 0.3秒静音触发回复
         
+        # 打断检测状态
+        self._interrupt_speech_frames = 0  # 检测到语音的帧数
+        self._interrupt_threshold = 5  # 连续5帧语音触发打断
+        self._tts_frame_count = 0  # TTS播放后的帧计数
+        self._tts_grace_period = 15  # TTS开始后15帧(~450ms)不检测打断
+        
         # 线程
         self._input_thread: Optional[threading.Thread] = None
 
@@ -164,13 +170,14 @@ class FullDuplexAgent:
                 
                 # 心跳
                 if time.time() - last_heartbeat > 3.0:
-                    logger.info(f"[心跳] frame={self._frame_count}, tts={self._tts_playing.is_set()}")
+                    tts_state = self._tts_playing.is_set()
+                    logger.info(f"[心跳] frame={self._frame_count}, tts={tts_state}")
                     last_heartbeat = time.time()
                 
-                # 核心规则：TTS 播放时屏蔽 VAD 检测
+                # 核心逻辑
                 if self._tts_playing.is_set():
-                    # TTS 播放中，跳过音频处理
-                    continue
+                    # TTS 播放中：检测打断
+                    self._detect_interrupt(audio)
                 else:
                     # 正常语音检测
                     self._handle_vad(audio)
@@ -180,6 +187,42 @@ class FullDuplexAgent:
                 time.sleep(0.05)
         
         logger.info("🎧 输入线程结束")
+
+    def _detect_interrupt(self, audio: bytes):
+        """
+        打断检测 - 使用 Silero VAD
+        
+        关键：使用语音概率而不是能量
+        - Silero VAD 判断是否是真正的语音
+        - 需要连续多帧确认
+        - TTS 开始后有静默期
+        """
+        self._tts_frame_count += 1
+        
+        # 静默期：TTS 开始后 N 帧内不检测
+        if self._tts_frame_count <= self._tts_grace_period:
+            return
+        
+        # 使用 Silero VAD 检测
+        result = self.vad.process_for_interrupt(audio)
+        speech_prob = result.get('speech_prob', 0)
+        is_speech = result.get('is_speech', False)
+        
+        # 条件：概率 > 0.6 且被识别为语音
+        if is_speech and speech_prob > 0.6:
+            self._interrupt_speech_frames += 1
+            
+            # 发送音频给 ASR
+            if self.asr.is_connected:
+                self.asr.send(audio)
+            
+            # 连续确认
+            if self._interrupt_speech_frames >= self._interrupt_threshold:
+                logger.info(f"⚡ 打断！prob={speech_prob:.2f}, frames={self._interrupt_speech_frames}")
+                self._stop_playback.set()
+        else:
+            # 重置计数
+            self._interrupt_speech_frames = max(0, self._interrupt_speech_frames - 1)
 
     def _handle_vad(self, audio: bytes):
         """正常 VAD 处理"""
@@ -225,13 +268,7 @@ class FullDuplexAgent:
             self._set_state(AgentState.IDLE)
 
     def _clean_asr_text(self, text: str) -> str:
-        """
-        清理 ASR 文本
-        
-        - 过滤纯语气词
-        - 处理 [模糊] 标注
-        - 去除无效内容
-        """
+        """清理 ASR 文本"""
         if not text:
             return ""
         
@@ -253,10 +290,6 @@ class FullDuplexAgent:
 
     def _generate_response(self, user_text: str) -> str:
         """生成回复"""
-        # 检查打断
-        if self._stop_playback.is_set():
-            return ""
-        
         # 添加到上下文
         self._context.append({"role": "user", "content": user_text})
         if len(self._context) > self._max_context * 2:
@@ -264,9 +297,6 @@ class FullDuplexAgent:
         
         # 生成
         response = self.llm.chat(user_text)
-        
-        if self._stop_playback.is_set():
-            return ""
         
         if response:
             # 口语化处理
@@ -276,14 +306,7 @@ class FullDuplexAgent:
         return response
 
     def _format_for_tts(self, text: str) -> str:
-        """
-        格式化为 TTS 口语文本
-        
-        规则：
-        - 仅保留逗号句号
-        - ≤80字
-        - 口语化
-        """
+        """格式化为 TTS 口语文本"""
         if not text:
             return ""
         
@@ -298,7 +321,6 @@ class FullDuplexAgent:
         
         # 长度控制
         if len(text) > 80:
-            # 在句号处截断
             sentences = re.split(r'[。]', text)
             result = ""
             for s in sentences:
@@ -338,9 +360,20 @@ class FullDuplexAgent:
         
         logger.info(f"🔊 播放 ({len(audio)} 字节): {text[:30]}...")
         
-        # 设置状态 - 关键：先设置 _tts_playing，再设置状态
+        # 设置状态
         self._tts_playing.set()
         self._set_state(AgentState.SPEAKING)
+        
+        # 重置打断检测状态
+        self._tts_frame_count = 0
+        self._interrupt_speech_frames = 0
+        self._stop_playback.clear()
+        
+        # 确保 ASR 运行
+        if not self.asr.is_connected:
+            self.asr.start()
+        
+        interrupted = False
         
         try:
             stream = self._pyaudio_out.open(
@@ -353,6 +386,11 @@ class FullDuplexAgent:
             
             chunk_size = 1024
             for i in range(0, len(audio), chunk_size):
+                # 检查打断
+                if self._stop_playback.is_set():
+                    logger.info("⚡ TTS 被打断")
+                    interrupted = True
+                    break
                 stream.write(audio[i:i+chunk_size])
             
             stream.stop_stream()
@@ -361,11 +399,41 @@ class FullDuplexAgent:
         except Exception as e:
             logger.error(f"播放错误: {e}")
         finally:
-            # 清除状态 - 关键：先清除 _tts_playing
             self._tts_playing.clear()
-            self._set_state(AgentState.IDLE)
             self._stop_playback.clear()
             self._set_state(AgentState.IDLE)
+            
+            if interrupted:
+                self._handle_interrupt()
+
+    def _handle_interrupt(self):
+        """处理打断"""
+        logger.info("处理打断...")
+        
+        # 等待 ASR 完成
+        time.sleep(0.3)
+        self.asr.stop()
+        
+        user_text = self.asr.get_result(timeout=0.3)
+        if not user_text:
+            user_text = self.asr.get_partial_text()
+        
+        if user_text:
+            user_text = self._clean_asr_text(user_text)
+        
+        if user_text:
+            logger.info(f"📝 打断识别: {user_text}")
+            print(f"\n⚡ 你: {user_text}")
+            
+            self.asr.start()
+            response = self._generate_response(user_text)
+            
+            if response:
+                print(f"🤖 助手: {response}")
+                self._tts_queue.put(response)
+        else:
+            logger.info("打断但未识别到语音")
+            self.asr.start()
 
     async def run(self):
         """运行"""
