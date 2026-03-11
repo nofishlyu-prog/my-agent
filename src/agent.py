@@ -78,15 +78,7 @@ class FullDuplexAgent:
         
         # 帧计数
         self._frame_count = 0
-        
-        # 打断检测状态
-        self._tts_energy_baseline = 0.0
-        self._tts_frames = 0
-        self._interrupt_frames = 0
-        self._interrupt_threshold = 10  # 连续10帧(~300ms)确认打断
         self._min_silence_ms = 300  # 0.3秒静音触发回复
-        self._tts_start_time = 0  # TTS开始时间
-        self._silence_period = 1.0  # TTS开始后1秒内不检测打断
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None
@@ -172,12 +164,13 @@ class FullDuplexAgent:
                 
                 # 心跳
                 if time.time() - last_heartbeat > 3.0:
-                    logger.info(f"[心跳] frame={self._frame_count}")
+                    logger.info(f"[心跳] frame={self._frame_count}, tts={self._tts_playing.is_set()}")
                     last_heartbeat = time.time()
                 
-                # TTS 播放时：打断检测
+                # 核心规则：TTS 播放时屏蔽 VAD 检测
                 if self._tts_playing.is_set():
-                    self._detect_interrupt(audio)
+                    # TTS 播放中，跳过音频处理
+                    continue
                 else:
                     # 正常语音检测
                     self._handle_vad(audio)
@@ -187,49 +180,6 @@ class FullDuplexAgent:
                 time.sleep(0.05)
         
         logger.info("🎧 输入线程结束")
-
-    def _detect_interrupt(self, audio: bytes):
-        """
-        打断检测 - 基于能量突变
-        
-        关键改进：
-        1. TTS开始后0.5秒静默期，不检测
-        2. 静默期后建立能量基线
-        3. 检测能量显著增加才触发
-        """
-        # 静默期检查
-        if self._tts_start_time > 0:
-            elapsed = time.time() - self._tts_start_time
-            if elapsed < self._silence_period:
-                # 静默期内，不检测
-                return
-        
-        samples = np.frombuffer(audio, dtype=np.int16)
-        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
-        
-        # 基线建立阶段（静默期后20帧）
-        if self._tts_frames < 20:
-            self._tts_energy_baseline = energy
-            self._tts_frames += 1
-            return
-        
-        # 慢速更新基线
-        alpha = 0.02  # 更慢的更新速度
-        self._tts_energy_baseline = alpha * energy + (1-alpha) * self._tts_energy_baseline
-        
-        # 检测突变
-        ratio = energy / self._tts_energy_baseline if self._tts_energy_baseline > 0 else 1.0
-        increase = energy - self._tts_energy_baseline
-        
-        # 提高阈值：比率>2.5 且 增量>3000（用户需要说话很大声）
-        if ratio > 2.5 and increase > 3000:
-            self._interrupt_frames += 1
-            if self._interrupt_frames >= self._interrupt_threshold:
-                logger.info(f"⚡ 打断: ratio={ratio:.2f}, increase={increase:.0f}")
-                self._stop_playback.set()
-                self._interrupt_frames = 0
-        else:
-            self._interrupt_frames = max(0, self._interrupt_frames - 1)
 
     def _handle_vad(self, audio: bytes):
         """正常 VAD 处理"""
@@ -388,20 +338,9 @@ class FullDuplexAgent:
         
         logger.info(f"🔊 播放 ({len(audio)} 字节): {text[:30]}...")
         
-        # 状态
-        self._set_state(AgentState.SPEAKING)
+        # 设置状态 - 关键：先设置 _tts_playing，再设置状态
         self._tts_playing.set()
-        self._stop_playback.clear()
-        
-        # 重置打断检测 - 关键：设置开始时间
-        self._tts_start_time = time.time()
-        self._tts_energy_baseline = 0
-        self._tts_frames = 0
-        self._interrupt_frames = 0
-        
-        # 确保 ASR 运行
-        if not self.asr.is_connected:
-            self.asr.start()
+        self._set_state(AgentState.SPEAKING)
         
         try:
             stream = self._pyaudio_out.open(
@@ -414,9 +353,6 @@ class FullDuplexAgent:
             
             chunk_size = 1024
             for i in range(0, len(audio), chunk_size):
-                if self._stop_playback.is_set():
-                    logger.info("⚡ 被打断")
-                    break
                 stream.write(audio[i:i+chunk_size])
             
             stream.stop_stream()
@@ -425,8 +361,9 @@ class FullDuplexAgent:
         except Exception as e:
             logger.error(f"播放错误: {e}")
         finally:
+            # 清除状态 - 关键：先清除 _tts_playing
             self._tts_playing.clear()
-            self._tts_start_time = 0
+            self._set_state(AgentState.IDLE)
             self._stop_playback.clear()
             self._set_state(AgentState.IDLE)
 
