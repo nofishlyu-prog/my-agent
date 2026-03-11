@@ -14,6 +14,7 @@ import threading
 import time
 import logging
 import platform
+from collections import deque
 from queue import Queue, Empty
 from typing import Optional, Callable, Dict, Any
 from enum import Enum
@@ -74,9 +75,13 @@ class FullDuplexAgent:
         # TTS 控制
         self._tts_playing = threading.Event()
         self._stop_playback = threading.Event()
-        self._tts_start_time = 0  # TTS 开始播放时间
+        self._tts_start_time = 0
         self._tts_thread: Optional[threading.Thread] = None
         self._tts_queue = Queue(maxsize=5)
+        
+        # TTS 参考信号缓冲（用于 AEC）
+        self._tts_reference_buffer = deque(maxlen=16000 * 2)  # 2 秒缓冲
+        self._tts_playback_position = 0  # 当前播放位置
         
         # 音频缓冲
         self._audio_buffer = bytearray()
@@ -221,38 +226,66 @@ class FullDuplexAgent:
             self._set_state(AgentState.IDLE)
 
     def _handle_interrupt_detection(self, audio: bytes):
-        """打断检测处理 - 使用 AEC 消除回声"""
-        # 静默期：TTS 开始后 200ms 内不做检测
+        """打断检测处理 - 使用参考信号减法消除回声"""
+        # 静默期：TTS 开始后 300ms 内不做检测
         if self._tts_start_time > 0:
             elapsed = time.time() - self._tts_start_time
-            if elapsed < 0.2:
+            if elapsed < 0.3:
                 return
         
-        # 使用 AEC 消除回声
-        # 注意：这里我们没有实时的 TTS 参考信号
-        # SimpleAEC 使用能量估计来抑制回声
-        clean_audio = self.aec.suppress_echo(audio)
+        # 转换音频
+        mic_samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
         
-        # 计算能量
-        samples = np.frombuffer(clean_audio, dtype=np.int16)
-        energy = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+        # === 关键：参考信号减法 ===
+        # 估计系统延迟（扬声器到麦克风的传播时间）
+        # macOS 通常 20-100ms
+        system_delay_ms = 50  # 可调整
+        system_delay_samples = int(self.config.sample_rate * system_delay_ms / 1000)
         
-        # 使用 Silero VAD 检测是否是语音
+        # 计算需要多少参考信号
+        samples_needed = len(mic_samples) + system_delay_samples
+        
+        if len(self._tts_reference_buffer) >= samples_needed:
+            # 获取对应的参考信号（考虑延迟）
+            ref_samples = np.array(list(self._tts_reference_buffer)[-samples_needed:-system_delay_samples], dtype=np.float32)
+            
+            # 确保长度匹配
+            if len(ref_samples) >= len(mic_samples):
+                ref_samples = ref_samples[:len(mic_samples)]
+                
+                # 减去参考信号（回声消除）
+                # 增益因子：麦克风捕获的回声通常比原始信号小
+                echo_gain = 0.3  # 可调整
+                clean_samples = mic_samples - ref_samples * echo_gain
+                clean_samples = np.clip(clean_samples, -32768, 32767)
+                
+                # 转回 bytes
+                clean_audio = clean_samples.astype(np.int16).tobytes()
+            else:
+                clean_audio = audio
+        else:
+            # 参考信号不足，使用原始信号
+            clean_audio = audio
+        
+        # 计算处理后能量
+        clean_energy = np.sqrt(np.mean(np.frombuffer(clean_audio, dtype=np.int16).astype(np.float32) ** 2))
+        
+        # 使用 Silero VAD 检测
         result = self.vad.process_for_interrupt(clean_audio)
         speech_prob = result.get('speech_prob', 0)
         is_speech = result.get('is_speech', False)
         
         # 只发送真正的语音给 ASR
-        if is_speech and speech_prob > 0.5:
+        if is_speech and speech_prob > 0.6:
             if self.asr.is_connected:
                 self.asr.send(clean_audio)
         
-        # 打断条件：必须是语音 AND 概率足够高
-        if is_speech and speech_prob > 0.7:
-            logger.info(f"[打断检测] speech_prob={speech_prob:.2f}, energy={energy:.1f}")
+        # 打断条件：概率 > 0.75（提高阈值）
+        if is_speech and speech_prob > 0.75:
+            logger.debug(f"[打断检测] prob={speech_prob:.2f}, clean_energy={clean_energy:.1f}")
             
             if result.get('speech_start'):
-                logger.info("⚡ 打断触发！")
+                logger.info(f"⚡ 打断触发！prob={speech_prob:.2f}, energy={clean_energy:.1f}")
                 self._stop_playback.set()
 
     def _tts_worker_loop(self):
@@ -288,17 +321,32 @@ class FullDuplexAgent:
         
         self._set_state(AgentState.SPEAKING)
         self._tts_playing.set()
-        self._tts_start_time = time.time()  # 记录开始时间
+        self._tts_start_time = time.time()
         self._stop_playback.clear()
         self.vad.set_tts_playing(True)
         self.vad.barge_in_detector.set_tts_state(True)
         
-        # 启动 ASR 支持打断
+        # === 清空并准备参考信号缓冲 ===
+        self._tts_reference_buffer.clear()
+        
+        # 重采样 TTS 音频到麦克风采样率（用于参考信号）
+        # TTS 采样率: 22050Hz, 麦克风: 16000Hz
+        tts_samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
+        
+        # 计算重采样比例
+        resample_ratio = self.config.sample_rate / self.config.tts_sample_rate
+        new_length = int(len(tts_samples) * resample_ratio)
+        
+        # 简单线性插值重采样
+        original_indices = np.linspace(0, len(tts_samples) - 1, new_length)
+        resampled = np.interp(original_indices, np.arange(len(tts_samples)), tts_samples)
+        
+        # 转换为 int16 并记录到参考缓冲
+        resampled_int16 = resampled.astype(np.int16)
+        
+        # 启动 ASR
         if not self.asr.is_connected:
             self.asr.start()
-        
-        # 重置 AEC
-        self.aec.reset()
         
         try:
             stream = self._pyaudio_out.open(
@@ -312,6 +360,10 @@ class FullDuplexAgent:
             chunk_size = 1024
             interrupted = False
             
+            # 计算每个输出 chunk 对应的重采样参考信号
+            tts_chunk_samples = chunk_size  # TTS 采样
+            ref_chunk_samples = int(tts_chunk_samples * resample_ratio)  # 对应的参考信号采样
+            
             for i in range(0, len(audio), chunk_size):
                 if self._stop_playback.is_set():
                     logger.info("⚡ TTS 被打断")
@@ -321,8 +373,13 @@ class FullDuplexAgent:
                 chunk = audio[i:i + chunk_size]
                 stream.write(chunk, exception_on_underflow=False)
                 
-                # 更新 AEC 的 TTS 能量估计
-                self.aec.update_tts_energy(chunk)
+                # 记录对应的参考信号
+                ref_start = int(i * resample_ratio)
+                ref_end = ref_start + ref_chunk_samples
+                if ref_end <= len(resampled_int16):
+                    ref_chunk = resampled_int16[ref_start:ref_end]
+                    for sample in ref_chunk:
+                        self._tts_reference_buffer.append(float(sample))
             
             stream.stop_stream()
             stream.close()
@@ -334,7 +391,7 @@ class FullDuplexAgent:
             logger.error(f"播放错误: {e}")
         finally:
             self._tts_playing.clear()
-            self._tts_start_time = 0  # 重置开始时间
+            self._tts_start_time = 0
             self._stop_playback.clear()
             self.vad.set_tts_playing(False)
             self.vad.barge_in_detector.set_tts_state(False)
