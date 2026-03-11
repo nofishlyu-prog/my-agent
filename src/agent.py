@@ -72,6 +72,10 @@ class FullDuplexAgent:
         # 音频缓冲
         self._audio_buffer = bytearray()
         
+        # AEC 参考 signal 缓冲
+        self._aec_buffer = deque(maxlen=16000 * 3)  # 3秒缓冲
+        self._aec_position = 0  # 当前播放位置
+        
         # 上下文管理 - 最近3轮有效对话
         self._context: List[dict] = []
         self._max_context = 3
@@ -81,11 +85,11 @@ class FullDuplexAgent:
         self._min_silence_ms = 300  # 0.3秒静音触发回复
         
         # 打断检测状态
-        self._interrupt_speech_frames = 0  # 检测到语音的帧数
-        self._interrupt_threshold = 10  # 连续10帧语音触发打断
-        self._tts_frame_count = 0  # TTS播放后的帧计数
-        self._tts_grace_period = 30  # TTS开始后30帧(~900ms)不检测打断
-        self._interrupt_prob_threshold = 0.85  # 概率阈值提高到0.85
+        self._interrupt_speech_frames = 0
+        self._interrupt_threshold = 5
+        self._tts_frame_count = 0
+        self._tts_grace_period = 20  # 20帧静默期
+        self._interrupt_prob_threshold = 0.7
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None
@@ -191,38 +195,64 @@ class FullDuplexAgent:
 
     def _detect_interrupt(self, audio: bytes):
         """
-        打断检测 - 使用 Silero VAD
+        打断检测 - 使用 AEC 回声消除
+        
+        核心原理：
+        1. 从麦克风输入减去 TTS 参考信号
+        2. 用 Silero VAD 检测消除回声后的信号
         """
         self._tts_frame_count += 1
         
-        # 静默期：TTS 开始后 N 帧内不检测
+        # 静默期
         if self._tts_frame_count <= self._tts_grace_period:
             return
         
-        # 直接使用 SileroVAD 的 process 方法
-        vad_result = self.vad.normal_vad.process(audio)
+        # === AEC 处理 ===
+        mic_samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
+        
+        # 从参考缓冲获取对应的样本
+        if len(self._aec_buffer) >= len(mic_samples):
+            # 计算延迟对齐（麦克风采样点对应之前的参考信号）
+            delay_samples = int(16000 * 0.05)  # 50ms 延迟
+            start_idx = max(0, len(self._aec_buffer) - len(mic_samples) - delay_samples)
+            end_idx = start_idx + len(mic_samples)
+            
+            if end_idx <= len(self._aec_buffer):
+                ref_samples = np.array(list(self._aec_buffer)[start_idx:end_idx], dtype=np.float32)
+                
+                # 减去参考信号（回声消除）
+                # 回声增益：麦克风捕获的回声通常比原始信号小
+                echo_gain = 0.4
+                clean_samples = mic_samples - ref_samples * echo_gain
+                clean_samples = np.clip(clean_samples, -32768, 32767)
+                clean_audio = clean_samples.astype(np.int16).tobytes()
+            else:
+                clean_audio = audio
+        else:
+            clean_audio = audio
+        
+        # 使用 Silero VAD 检测消除回声后的信号
+        vad_result = self.vad.normal_vad.process(clean_audio)
         
         speech_prob = vad_result.get('speech_prob', 0)
         is_speech = vad_result.get('is_speech', False)
         
-        # 添加调试日志
+        # 调试日志
         if speech_prob > 0.3:
-            logger.info(f"[打断] prob={speech_prob:.2f}, is_speech={is_speech}, frames={self._interrupt_speech_frames}")
+            logger.info(f"[打断] prob={speech_prob:.2f}, frames={self._interrupt_speech_frames}")
         
-        # 条件：概率 > 0.85（大幅提高）且被识别为语音
+        # 条件
         if is_speech and speech_prob > self._interrupt_prob_threshold:
             self._interrupt_speech_frames += 1
             
-            # 发送音频给 ASR
+            # 发送给 ASR
             if self.asr.is_connected:
-                self.asr.send(audio)
+                self.asr.send(clean_audio)
             
-            # 连续确认
             if self._interrupt_speech_frames >= self._interrupt_threshold:
-                logger.info(f"⚡ 打断！prob={speech_prob:.2f}, frames={self._interrupt_speech_frames}")
+                logger.info(f"⚡ 打断！prob={speech_prob:.2f}")
                 self._stop_playback.set()
         else:
-            # 重置计数
             self._interrupt_speech_frames = max(0, self._interrupt_speech_frames - 1)
 
     def _handle_vad(self, audio: bytes):
@@ -370,6 +400,21 @@ class FullDuplexAgent:
         self._interrupt_speech_frames = 0
         self._stop_playback.clear()
         
+        # === AEC: 准备参考信号 ===
+        self._aec_buffer.clear()
+        
+        # 重采样 TTS 音频到麦克风采样率 (22050Hz -> 16000Hz)
+        tts_samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32)
+        resample_ratio = 16000 / 22050
+        new_length = int(len(tts_samples) * resample_ratio)
+        original_indices = np.linspace(0, len(tts_samples) - 1, new_length)
+        resampled = np.interp(original_indices, np.arange(len(tts_samples)), tts_samples)
+        resampled_int16 = resampled.astype(np.int16)
+        
+        # 存入参考缓冲
+        for s in resampled_int16:
+            self._aec_buffer.append(float(s))
+        
         # 确保 ASR 运行
         if not self.asr.is_connected:
             self.asr.start()
@@ -387,7 +432,6 @@ class FullDuplexAgent:
             
             chunk_size = 1024
             for i in range(0, len(audio), chunk_size):
-                # 检查打断
                 if self._stop_playback.is_set():
                     logger.info("⚡ TTS 被打断")
                     interrupted = True
