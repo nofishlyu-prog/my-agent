@@ -83,10 +83,10 @@ class FullDuplexAgent:
         self._tts_energy_baseline = 0.0
         self._tts_frames = 0
         self._interrupt_frames = 0
-        self._interrupt_threshold = 8  # 连续8帧(~240ms)确认打断
+        self._interrupt_threshold = 10  # 连续10帧(~300ms)确认打断
         self._min_silence_ms = 300  # 0.3秒静音触发回复
         self._tts_start_time = 0  # TTS开始时间
-        self._silence_period = 0.5  # TTS开始后0.5秒内不检测打断
+        self._silence_period = 1.0  # TTS开始后1秒内不检测打断
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None
@@ -221,8 +221,8 @@ class FullDuplexAgent:
         ratio = energy / self._tts_energy_baseline if self._tts_energy_baseline > 0 else 1.0
         increase = energy - self._tts_energy_baseline
         
-        # 提高阈值：比率>1.8 且 增量>200
-        if ratio > 1.8 and increase > 200:
+        # 提高阈值：比率>2.5 且 增量>3000（用户需要说话很大声）
+        if ratio > 2.5 and increase > 3000:
             self._interrupt_frames += 1
             if self._interrupt_frames >= self._interrupt_threshold:
                 logger.info(f"⚡ 打断: ratio={ratio:.2f}, increase={increase:.0f}")
