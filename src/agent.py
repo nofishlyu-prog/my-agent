@@ -82,9 +82,10 @@ class FullDuplexAgent:
         
         # 打断检测状态
         self._interrupt_speech_frames = 0  # 检测到语音的帧数
-        self._interrupt_threshold = 5  # 连续5帧语音触发打断
+        self._interrupt_threshold = 10  # 连续10帧语音触发打断
         self._tts_frame_count = 0  # TTS播放后的帧计数
-        self._tts_grace_period = 15  # TTS开始后15帧(~450ms)不检测打断
+        self._tts_grace_period = 30  # TTS开始后30帧(~900ms)不检测打断
+        self._interrupt_prob_threshold = 0.85  # 概率阈值提高到0.85
         
         # 线程
         self._input_thread: Optional[threading.Thread] = None
@@ -208,8 +209,8 @@ class FullDuplexAgent:
         if speech_prob > 0.3:
             logger.info(f"[打断] prob={speech_prob:.2f}, is_speech={is_speech}, frames={self._interrupt_speech_frames}")
         
-        # 条件：概率 > 0.6 且被识别为语音
-        if is_speech and speech_prob > 0.6:
+        # 条件：概率 > 0.85（大幅提高）且被识别为语音
+        if is_speech and speech_prob > self._interrupt_prob_threshold:
             self._interrupt_speech_frames += 1
             
             # 发送音频给 ASR
