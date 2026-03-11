@@ -192,10 +192,7 @@ class FullDuplexAgent:
         """
         打断检测 - 使用 Silero VAD
         
-        关键：使用语音概率而不是能量
-        - Silero VAD 判断是否是真正的语音
-        - 需要连续多帧确认
-        - TTS 开始后有静默期
+        关键：直接使用已加载的 VAD，不重新创建
         """
         self._tts_frame_count += 1
         
@@ -203,10 +200,12 @@ class FullDuplexAgent:
         if self._tts_frame_count <= self._tts_grace_period:
             return
         
-        # 使用 Silero VAD 检测
-        result = self.vad.process_for_interrupt(audio)
-        speech_prob = result.get('speech_prob', 0)
-        is_speech = result.get('is_speech', False)
+        # 直接使用 SileroVAD 的 process 方法，不用 BargeInDetector
+        # 因为 BargeInDetector 会重新创建 VAD 实例
+        vad_result = self.vad.normal_vad.process(audio)
+        
+        speech_prob = vad_result.get('speech_prob', 0)
+        is_speech = vad_result.get('is_speech', False)
         
         # 条件：概率 > 0.6 且被识别为语音
         if is_speech and speech_prob > 0.6:
